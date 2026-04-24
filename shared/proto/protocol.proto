@@ -1,0 +1,342 @@
+// MiniLink Protocol - 小程序多人联机轻量化框架通信协议
+// 参考 Mirror 的消息体系设计，精简为小程序场景所需
+
+syntax = "proto3";
+
+package minilink;
+
+// ============================================================
+// 枚举定义
+// ============================================================
+
+// 消息类型（用于路由分发）
+enum MsgType {
+  MSG_TYPE_UNKNOWN        = 0;
+
+  // --- 连接/认证 ---
+  MSG_TYPE_HANDSHAKE_REQ  = 1;
+  MSG_TYPE_HANDSHAKE_RESP = 2;
+  MSG_TYPE_HEARTBEAT      = 3;
+  MSG_TYPE_DISCONNECT     = 4;
+
+  // --- 房间管理 ---
+  MSG_TYPE_ROOM_CREATE    = 10;
+  MSG_TYPE_ROOM_JOIN      = 11;
+  MSG_TYPE_ROOM_LEAVE     = 12;
+  MSG_TYPE_ROOM_DISMISS   = 13;
+  MSG_TYPE_ROOM_LIST      = 14;
+  MSG_TYPE_ROOM_READY     = 15;
+  MSG_TYPE_ROOM_START     = 16;
+  MSG_TYPE_ROOM_STATE     = 17;
+  MSG_TYPE_ROOM_MATCH     = 18;
+
+  // --- 同步 ---
+  MSG_TYPE_SYNC_VAR       = 20;
+  MSG_TYPE_SYNC_LIST      = 21;
+  MSG_TYPE_SNAPSHOT       = 22;
+  MSG_TYPE_INPUT_FRAME    = 23;
+
+  // --- RPC ---
+  MSG_TYPE_COMMAND        = 30;
+  MSG_TYPE_CLIENT_RPC     = 31;
+  MSG_TYPE_TARGET_RPC     = 32;
+
+  // --- 生成对象 ---
+  MSG_TYPE_SPAWN          = 40;
+  MSG_TYPE_DESTROY        = 41;
+
+  // --- 微信适配 ---
+  MSG_TYPE_WX_LOGIN       = 50;
+  MSG_TYPE_WX_SHARE       = 51;
+
+  // --- 错误 ---
+  MSG_TYPE_ERROR          = 99;
+}
+
+// 连接状态
+enum ConnectionState {
+  CONN_STATE_DISCONNECTED = 0;
+  CONN_STATE_CONNECTING   = 1;
+  CONN_STATE_CONNECTED    = 2;
+  CONN_STATE_RECONNECTING = 3;
+}
+
+// 同步模式
+enum SyncMode {
+  SYNC_MODE_STATE         = 0;  // 状态同步
+  SYNC_MODE_FRAME         = 1;  // 帧同步
+  SYNC_MODE_HYBRID        = 2;  // 混合模式
+}
+
+// 房间状态
+enum RoomState {
+  ROOM_STATE_WAITING  = 0;
+  ROOM_STATE_READY    = 1;
+  ROOM_STATE_PLAYING  = 2;
+  ROOM_STATE_FINISHED = 3;
+}
+
+// 错误码
+enum ErrorCode {
+  ERROR_NONE              = 0;
+  ERROR_ROOM_FULL         = 1;
+  ERROR_ROOM_NOT_FOUND    = 2;
+  ERROR_PASSWORD_WRONG    = 3;
+  ERROR_ALREADY_IN_ROOM   = 4;
+  ERROR_NOT_IN_ROOM       = 5;
+  ERROR_NOT_HOST          = 6;
+  ERROR_NOT_READY         = 7;
+  ERROR_TIMEOUT           = 8;
+  ERROR_AUTH_FAILED       = 9;
+  ERROR_INTERNAL          = 10;
+}
+
+// ============================================================
+// 顶层消息包装
+// ============================================================
+
+message NetMessage {
+  MsgType type    = 1;
+  uint32 seq     = 2;   // 序列号，用于确认和重排
+  int64  timestamp = 3; // 毫秒时间戳
+  oneof payload {
+    HandshakeReq     handshake_req     = 10;
+    HandshakeResp    handshake_resp    = 11;
+    Heartbeat        heartbeat         = 12;
+    DisconnectMsg    disconnect_msg    = 13;
+
+    RoomCreateReq    room_create_req   = 20;
+    RoomJoinReq      room_join_req     = 21;
+    RoomLeaveReq     room_leave_req    = 22;
+    RoomDismissReq   room_dismiss_req  = 23;
+    RoomListReq      room_list_req     = 24;
+    RoomReadyReq     room_ready_req    = 25;
+    RoomStartReq     room_start_req    = 26;
+    RoomStateNotify  room_state_notify = 27;
+    RoomMatchReq     room_match_req    = 28;
+
+    SyncVarMsg       sync_var_msg      = 30;
+    SyncListMsg      sync_list_msg     = 31;
+    SnapshotMsg      snapshot_msg      = 32;
+    InputFrameMsg    input_frame_msg   = 33;
+
+    CommandMsg       command_msg       = 40;
+    ClientRpcMsg     client_rpc_msg    = 41;
+    TargetRpcMsg     target_rpc_msg    = 42;
+
+    SpawnMsg         spawn_msg         = 50;
+    DestroyMsg       destroy_msg       = 51;
+
+    WxLoginReq       wx_login_req      = 60;
+    WxLoginResp      wx_login_resp     = 61;
+    WxShareReq       wx_share_req      = 62;
+
+    ErrorMsg         error_msg         = 99;
+  }
+}
+
+// ============================================================
+// 连接/认证消息
+// ============================================================
+
+message HandshakeReq {
+  string client_id    = 1;  // 客户端唯一标识
+  string token        = 2;  // 认证token（微信登录后获取）
+  string version      = 3;  // 协议版本
+  map<string, string> extra = 4; // 扩展字段
+}
+
+message HandshakeResp {
+  bool   success      = 1;
+  string session_id   = 2;
+  string server_time  = 3;
+  int32  reconnect_ttl = 4; // 断线重连有效时间(秒)
+}
+
+message Heartbeat {
+  int64  client_time  = 1;  // 客户端时间戳
+  int32  ping_ms      = 2;  // 客户端估算延迟
+}
+
+message DisconnectMsg {
+  string reason = 1;
+}
+
+// ============================================================
+// 房间管理消息
+// ============================================================
+
+message PlayerInfo {
+  string player_id   = 1;
+  string nickname    = 2;
+  string avatar_url  = 3;
+  bool   is_ready    = 4;
+  bool   is_host     = 5;
+  int32  slot_index  = 6;
+}
+
+message RoomCreateReq {
+  string room_name    = 1;
+  int32  max_players  = 2;
+  string password     = 3;
+  map<string, string> settings = 4; // 游戏自定义设置
+}
+
+message RoomJoinReq {
+  string room_id   = 1;
+  string password  = 2;
+}
+
+message RoomLeaveReq {}
+
+message RoomDismissReq {}
+
+message RoomListReq {
+  int32 page       = 1;
+  int32 page_size  = 2;
+}
+
+message RoomReadyReq {
+  bool ready = 1;
+}
+
+message RoomStartReq {}
+
+message RoomMatchReq {
+  int32  max_players = 1;
+  map<string, string> match_attrs = 2; // 匹配属性
+}
+
+message RoomStateNotify {
+  string       room_id    = 1;
+  string       room_name  = 2;
+  RoomState    state      = 3;
+  int32        max_players = 4;
+  string       host_id    = 5;
+  repeated PlayerInfo players = 6;
+  map<string, string>  settings = 7;
+}
+
+message RoomListResp {
+  repeated RoomStateNotify rooms    = 1;
+  int32                    total    = 2;
+}
+
+// ============================================================
+// 同步消息
+// ============================================================
+
+// SyncVar 增量同步（参考Mirror脏标记机制）
+message SyncVarMsg {
+  uint32 net_id        = 1;  // NetworkIdentity.netId
+  string component     = 2;  // 组件名hash
+  int32  dirty_mask    = 3;  // 脏标记位掩码
+  bytes  payload       = 4;  // 序列化的变更字段值
+}
+
+// SyncList 操作
+message SyncListMsg {
+  uint32 net_id     = 1;
+  string component  = 2;
+  string list_name  = 3;
+  enum Operation {
+    OP_ADD      = 0;
+    OP_INSERT   = 1;
+    OP_REMOVE_AT = 2;
+    OP_CLEAR    = 3;
+    OP_SET      = 4;
+  }
+  Operation operation = 4;
+  int32     index     = 5;
+  bytes     value     = 6;
+}
+
+// 快照同步（参考Mirror SnapshotInterpolation）
+message SnapshotMsg {
+  uint32 net_id       = 1;
+  int64  remote_tick  = 2;  // 远端tick
+  float  remote_time  = 3;  // 远端时间
+  bytes  state_data   = 4;  // 完整状态数据
+}
+
+// 帧同步输入
+message InputFrameMsg {
+  uint32 net_id       = 1;
+  int32  frame        = 2;  // 帧号
+  bytes  input_data   = 3;  // 输入数据
+}
+
+// ============================================================
+// RPC 消息
+// ============================================================
+
+// Command: 客户端→服务端
+message CommandMsg {
+  uint32 net_id          = 1;
+  string method_hash     = 2;
+  bytes  args            = 3;
+  bool   requires_auth   = 4; // requiresAuthority
+}
+
+// ClientRpc: 服务端→所有客户端
+message ClientRpcMsg {
+  uint32 net_id          = 1;
+  string method_hash     = 2;
+  bytes  args            = 3;
+  bool   include_owner   = 4;
+}
+
+// TargetRpc: 服务端→指定客户端
+message TargetRpcMsg {
+  uint32 net_id          = 1;
+  string method_hash     = 2;
+  bytes  args            = 3;
+  string target_conn_id  = 4;
+}
+
+// ============================================================
+// 生成/销毁对象
+// ============================================================
+
+message SpawnMsg {
+  uint32 net_id          = 1;
+  uint32 prefab_hash     = 2; // 预制体hash
+  string owner_conn_id   = 3;
+  bytes  initial_state   = 4; // 初始SyncVar数据
+}
+
+message DestroyMsg {
+  uint32 net_id = 1;
+}
+
+// ============================================================
+// 微信适配
+// ============================================================
+
+message WxLoginReq {
+  string code        = 1;  // wx.login() 获取的code
+  string nickname    = 2;
+  string avatar_url  = 3;
+}
+
+message WxLoginResp {
+  bool   success     = 1;
+  string token       = 2;
+  string openid      = 3;
+  string session_key = 4;
+}
+
+message WxShareReq {
+  string title       = 1;
+  string image_url   = 2;
+  string room_id     = 3;  // 分享携带房间号
+}
+
+// ============================================================
+// 错误消息
+// ============================================================
+
+message ErrorMsg {
+  ErrorCode code    = 1;
+  string    message = 2;
+}

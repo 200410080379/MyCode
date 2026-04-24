@@ -1,0 +1,24 @@
+{
+  "name": "minilink-server",
+  "version": "1.0.0",
+  "description": "MiniLink - 小程序游戏多人联机轻量化框架服务端",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "proto": "pbjs ../shared/proto/protocol.proto -t static-module -w commonjs -o src/generated/protocol.js && pbts ../shared/proto/protocol.proto -o src/generated/protocol.d.ts"
+  },
+  "dependencies": {
+    "ws": "^8.16.0",
+    "protobufjs": "^7.2.6",
+    "express": "^4.18.2",
+    "uuid": "^9.0.0",
+    "axios": "^1.6.0"
+  },
+  "devDependencies": {
+    "protobufjs-cli": "^1.1.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
