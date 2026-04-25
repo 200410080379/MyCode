@@ -3,12 +3,12 @@ mergeInto(LibraryManager.library, {
         wx.login({
             success: function(res) {
                 if (res.code) {
-                    SendMessage('WechatLogin', 'OnWxLoginCode', res.code);
+                    SendMessage('WechatLoginBridge', 'OnWxLoginCode', res.code);
                 }
             },
             fail: function(err) {
                 console.error('[WechatLogin] wx.login fail:', err);
-                SendMessage('WechatLogin', 'OnLoginFailed', err.errMsg || 'login_failed');
+                SendMessage('WechatLoginBridge', 'OnLoginFailed', err.errMsg || 'login_failed');
             }
         });
     },
@@ -35,7 +35,7 @@ mergeInto(LibraryManager.library, {
         wx.getUserInfo({
             success: function(res) {
                 var userInfo = JSON.stringify(res.userInfo);
-                SendMessage('WechatLogin', 'OnWxUserInfo', userInfo);
+                SendMessage('WechatLoginBridge', 'OnWxUserInfo', userInfo);
             },
             fail: function(err) {
                 console.error('[WechatLogin] getUserInfo fail:', err);

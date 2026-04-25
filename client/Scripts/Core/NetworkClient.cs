@@ -350,9 +350,16 @@ namespace MiniLink
         {
             var roomMsg = msg["room_state_notify"] as Dictionary<string, object>;
             if (roomMsg == null) return;
-
-            // 通知房间管理器
-            NetworkRoomManager.OnRoomStateUpdate(roomMsg);
+            
+            // 检查 singleton 是否存在，避免 NullReferenceException
+            if (NetworkRoomManager.singleton != null)
+            {
+                NetworkRoomManager.OnRoomStateUpdate(roomMsg);
+            }
+            else
+            {
+                Debug.LogWarning("[MiniLink] NetworkRoomManager.singleton 未初始化，无法处理房间状态");
+            }
         }
 
         private static void ProcessCommand(Dictionary<string, object> msg)
@@ -621,7 +628,43 @@ namespace MiniLink
             SendJson(msg);
         }
 
-        private static void SendJson(Dictionary<string, object> msg)
+        /// <summary>
+        /// 重连服务器
+        /// </summary>
+        public static void Reconnect(string serverUrl)
+        {
+            // 先断开现有连接
+            if (isConnected)
+            {
+                Disconnect();
+            }
+
+            // 连接新地址
+            Connect(serverUrl);
+        }
+
+        /// <summary>
+        /// 发送时间同步请求（用于延迟补偿）
+        /// </summary>
+        public static void SendTimeSync()
+        {
+            if (!isConnected) return;
+
+            var msg = new Dictionary<string, object>
+            {
+                ["type"] = 90,
+                ["seq"] = connection.nextSeq(),
+                ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                ["time_sync_req"] = new Dictionary<string, object>
+                {
+                    ["client_send_time"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                }
+            };
+
+            SendJson(msg);
+        }
+
+        public static void SendJson(Dictionary<string, object> msg)
         {
             string json = MiniJson.Serialize(msg);
             byte[] data = System.Text.Encoding.UTF8.GetBytes(json);

@@ -23,6 +23,14 @@ class MessageHandler {
       30: this._onCommand.bind(this),
       50: this._onWxLogin.bind(this),
       51: this._onWxShare.bind(this),
+      // 帧同步消息
+      70: this._onFramePause.bind(this),
+      72: this._onFrameInput.bind(this),
+      // 断线重连消息
+      80: this._onReconnectState.bind(this),
+      82: this._onReconnectRequest.bind(this),
+      // 延迟补偿（时间同步）
+      90: this._onTimeSync.bind(this),
     };
   }
 
@@ -286,8 +294,11 @@ class MessageHandler {
 
     // Command 在服务端执行，通过 ClientRpc 返回结果给客户端
     // 具体业务逻辑由上层注册的 handler 处理
-    // 这里只做路由
-    this.server.emit('command', { conn, cmd });
+    // 这里只做路由 - 注意：如需要事件机制，请在 MiniLinkServer 中添加 EventEmitter
+    // this.server.emit('command', { conn, cmd });
+
+    // 简化实现：直接回复（实际项目应注册 Command 处理器）
+    console.log(`[MessageHandler] 收到Command: ${cmd.method_hash} from ${conn.connId}`);
   }
 
   // ==================== 微信 ====================
@@ -336,6 +347,97 @@ class MessageHandler {
     // 微信分享在客户端完成，服务端只记录
     const req = msg.wx_share_req;
     console.log(`[MessageHandler] 分享: room=${req.room_id} by ${conn.connId}`);
+  }
+
+  // ==================== 帧同步 ====================
+
+  _onFramePause(conn, msg) {
+    const req = msg.frame_pause_msg;
+    if (!req) return;
+    // 只有主机可以暂停
+    const room = conn.roomId ? this.server.roomManager.getRoom(conn.roomId) : null;
+    if (!room) return;
+    const player = room.players.get(conn.connId);
+    if (!player || !player.isHost) return;
+    this.server.frameSyncManager.setPaused(conn.roomId, req.paused);
+  }
+
+  _onFrameInput(conn, msg) {
+    // 帧同步输入由 FrameSyncManager 处理
+    this.server.frameSyncManager.receiveInput(conn.connId, msg);
+  }
+
+  // ==================== 断线重连 ====================
+
+  _onReconnectState(conn, msg) {
+    // 客户端查询重连状态
+    const state = this.server.reconnectionManager.isWaitingReconnect(conn.connId);
+    conn.send({
+      type: 80,
+      seq: this.server.nextSeq(),
+      timestamp: Date.now(),
+      player_reconnect_msg: {
+        conn_id: conn.connId,
+        state: state ? 'waiting' : 'none',
+      },
+    });
+  }
+
+  _onReconnectRequest(conn, msg) {
+    const req = msg.reconnect_req;
+    if (!req) return;
+
+    // 通过 playerId 查找旧连接
+    const oldState = this.server.reconnectionManager.findByPlayerId(req.player_id);
+    if (!oldState) {
+      conn.send({
+        type: 81,
+        seq: this.server.nextSeq(),
+        timestamp: Date.now(),
+        reconnect_result_msg: {
+          success: false,
+          reason: 'no_saved_state',
+        },
+      });
+      return;
+    }
+
+    const result = this.server.reconnectionManager.tryReconnect(
+      oldState.connId, conn.connId, req.room_id
+    );
+
+    if (!result.success) {
+      conn.send({
+        type: 81,
+        seq: this.server.nextSeq(),
+        timestamp: Date.now(),
+        reconnect_result_msg: {
+          success: false,
+          reason: result.reason,
+        },
+      });
+    }
+    // 成功的情况在 tryReconnect 中已发送
+  }
+
+  // ==================== 延迟补偿（时间同步）====================
+
+  _onTimeSync(conn, msg) {
+    const req = msg.time_sync_req;
+    if (!req) return;
+
+    const serverReceiveTime = Date.now();
+
+    conn.send({
+      type: 91, // MSG_TYPE_TIME_SYNC_RESP
+      seq: this.server.nextSeq(),
+      timestamp: serverReceiveTime,
+      time_sync_resp: {
+        client_send_time: req.client_send_time,
+        server_receive_time: serverReceiveTime,
+        server_send_time: Date.now(),
+      },
+    });
   }
 
   // ==================== 工具方法 ====================

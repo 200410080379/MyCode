@@ -8,9 +8,29 @@ namespace MiniLink
     /// <summary>
     /// 微信小程序WebSocket传输层
     /// 通过DllImport调用微信小游戏WebSocket API
+    /// 注意：此组件需要添加到场景中的 GameObject 上，名称必须为 "WxWebSocketBridge"
     /// </summary>
-    public class WxWebSocketTransport : ITransport
+    public class WxWebSocketTransport : MonoBehaviour, ITransport
     {
+        #region Singleton Pattern
+        
+        /// <summary>单例实例（用于 JSLIB 回调）</summary>
+        public static WxWebSocketTransport singleton { get; private set; }
+        
+        private void Awake()
+        {
+            if (singleton != null && singleton != this)
+            {
+                Destroy(gameObject);
+                return;
+            }
+            singleton = this;
+            DontDestroyOnLoad(gameObject);
+            gameObject.name = "WxWebSocketBridge"; // 确保名称正确，用于 SendMessage
+        }
+        
+        #endregion
+
         #region Events
 
         public event Action OnConnected;
@@ -23,11 +43,6 @@ namespace MiniLink
 
         private bool isConnectedInternal;
         private int socketTaskId = -1;
-
-        // 微信WebSocket任务状态
-        private const int WX_SOCKET_STATUS_OPEN = 1;
-        private const int WX_SOCKET_STATUS_CLOSING = 2;
-        private const int WX_SOCKET_STATUS_CLOSED = 3;
 
         #endregion
 
@@ -46,7 +61,6 @@ namespace MiniLink
             Debug.Log($"[WxWebSocket] 连接: {url}");
 
             // 微信小游戏环境下调用 wx.connectSocket
-            // 通过JSLIB桥接
             WxConnectSocket(url);
         }
 
@@ -76,9 +90,6 @@ namespace MiniLink
 
         #region 微信API桥接 (DllImport)
 
-        // 微信小游戏 WebSocket API 通过 Unity WebGL JSLIB 暥接
-        // 实际运行时会调用 JavaScript 层的 wx API
-
         [DllImport("__Internal")]
         private static extern int wx_connect_socket(string url);
 
@@ -88,7 +99,6 @@ namespace MiniLink
         [DllImport("__Internal")]
         private static extern void wx_send_socket_message(int socketTaskId, byte[] data, int length);
 
-        // 微信API包装方法
         private void WxConnectSocket(string url)
         {
 #if UNITY_WEBGL && !UNITY_EDITOR
@@ -114,16 +124,15 @@ namespace MiniLink
 #if UNITY_WEBGL && !UNITY_EDITOR
             wx_send_socket_message(taskId, data, data.Length);
 #else
-            // 编辑器模拟：打印日志
             Debug.Log($"[WxWebSocket] 模拟发送: {data.Length} bytes");
 #endif
         }
 
         #endregion
 
-        #region Callbacks (由JavaScript调用)
+        #region Callbacks (由 JavaScript SendMessage 调用)
 
-        // WebSocket连接成功回调（由JSLIB调用）
+        /// <summary>WebSocket连接成功回调（由 JSLIB SendMessage 调用）</summary>
         private void OnSocketOpen(string taskId)
         {
             Debug.Log($"[WxWebSocket] 连接成功 taskId={taskId}");
@@ -132,7 +141,7 @@ namespace MiniLink
             OnConnected?.Invoke();
         }
 
-        // WebSocket断开回调
+        /// <summary>WebSocket断开回调</summary>
         private void OnSocketClose(string reason)
         {
             Debug.Log($"[WxWebSocket] 断开: {reason}");
@@ -141,15 +150,14 @@ namespace MiniLink
             OnDisconnected?.Invoke();
         }
 
-        // WebSocket消息回调
+        /// <summary>WebSocket消息回调</summary>
         private void OnSocketMessage(string message)
         {
-            // 微信小程序接收的是字符串消息
             byte[] data = System.Text.Encoding.UTF8.GetBytes(message);
             OnDataReceived?.Invoke(data);
         }
 
-        // WebSocket错误回调
+        /// <summary>WebSocket错误回调</summary>
         private void OnSocketError(string errMsg)
         {
             Debug.LogError($"[WxWebSocket] 错误: {errMsg}");
@@ -160,61 +168,3 @@ namespace MiniLink
         #endregion
     }
 }
-
-// ==================== JSLIB (Unity WebGL桥接) ====================
-/*
-需要在 Unity 项目中添加 JSLIB 文件 (Plugins/WebGL/WxWebSocket.jslib):
-
-mergeInto(LibraryManager.library, {
-    wx_connect_socket: function(url) {
-        var urlStr = Pointer_stringify(url);
-        var socketTask = wx.connectSocket({
-            url: urlStr,
-            success: function(res) {
-                console.log('[WxWebSocket] connect success');
-            },
-            fail: function(err) {
-                console.error('[WxWebSocket] connect fail:', err);
-            }
-        });
-
-        var taskId = socketTask.socketTaskId || 1;
-
-        socketTask.onOpen(function(res) {
-            _WxWebSocketTransport_OnSocketOpen(taskId.toString());
-        });
-
-        socketTask.onClose(function(res) {
-            _WxWebSocketTransport_OnSocketClose(res.reason || 'closed');
-        });
-
-        socketTask.onMessage(function(res) {
-            _WxWebSocketTransport_OnSocketMessage(res.data);
-        });
-
-        socketTask.onError(function(err) {
-            _WxWebSocketTransport_OnSocketError(err.errMsg || 'error');
-        });
-
-        return taskId;
-    },
-
-    wx_close_socket: function(taskId) {
-        wx.closeSocket();
-    },
-
-    wx_send_socket_message: function(taskId, dataPtr, length) {
-        var data = new Uint8Array(Module.HEAPU8.buffer, dataPtr, length);
-        var str = String.fromCharCode.apply(null, data);
-        wx.sendSocketMessage({
-            data: str,
-            success: function() {
-                console.log('[WxWebSocket] send success');
-            },
-            fail: function(err) {
-                console.error('[WxWebSocket] send fail:', err);
-            }
-        });
-    }
-});
-*/

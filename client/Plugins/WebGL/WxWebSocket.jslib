@@ -8,25 +8,27 @@ mergeInto(LibraryManager.library, {
             },
             fail: function(err) {
                 console.error('[WxWebSocket] connect fail:', err);
+                // 通知 C# 层连接失败
+                SendMessage('WxWebSocketBridge', 'OnSocketError', err.errMsg || 'connect_failed');
             }
         });
 
         var taskId = socketTask.socketTaskId || 1;
 
         socketTask.onOpen(function(res) {
-            SendMessage('NetworkClient', 'OnSocketOpen', taskId.toString());
+            SendMessage('WxWebSocketBridge', 'OnSocketOpen', taskId.toString());
         });
 
         socketTask.onClose(function(res) {
-            SendMessage('NetworkClient', 'OnSocketClose', res.reason || 'closed');
+            SendMessage('WxWebSocketBridge', 'OnSocketClose', res.reason || 'closed');
         });
 
         socketTask.onMessage(function(res) {
-            SendMessage('NetworkClient', 'OnSocketMessage', res.data);
+            SendMessage('WxWebSocketBridge', 'OnSocketMessage', res.data);
         });
 
         socketTask.onError(function(err) {
-            SendMessage('NetworkClient', 'OnSocketError', err.errMsg || 'error');
+            SendMessage('WxWebSocketBridge', 'OnSocketError', err.errMsg || 'error');
         });
 
         return taskId;

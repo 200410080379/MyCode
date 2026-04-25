@@ -49,6 +49,20 @@ enum MsgType {
   MSG_TYPE_WX_LOGIN       = 50;
   MSG_TYPE_WX_SHARE       = 51;
 
+  // --- 帧同步 ---
+  MSG_TYPE_FRAME_PAUSE    = 70;
+  MSG_TYPE_FRAME_CONFIRM  = 71;
+  MSG_TYPE_FRAME_INPUT    = 72;
+
+  // --- 断线重连 ---
+  MSG_TYPE_RECONNECT_STATE  = 80;
+  MSG_TYPE_RECONNECT_RESULT = 81;
+  MSG_TYPE_RECONNECT_REQUEST = 82;
+
+  // --- 延迟补偿 ---
+  MSG_TYPE_TIME_SYNC_REQ  = 90;
+  MSG_TYPE_TIME_SYNC_RESP = 91;
+
   // --- 错误 ---
   MSG_TYPE_ERROR          = 99;
 }
@@ -339,4 +353,74 @@ message WxShareReq {
 message ErrorMsg {
   ErrorCode code    = 1;
   string    message = 2;
+}
+
+// ============================================================
+// 帧同步（新增）
+// ============================================================
+
+message FramePauseMsg {
+  bool   paused    = 1;
+  uint32 frame     = 2;
+}
+
+message FrameConfirmMsg {
+  uint32 frame        = 1;
+  repeated InputEntry inputs = 2;
+  uint64 server_time  = 3;
+}
+
+message InputEntry {
+  uint32 net_id      = 1;
+  uint32 frame       = 2;
+  bytes  input_data  = 3;
+  bool   timeout     = 4; // 是否为超时填充
+}
+
+message FrameInputMsg {
+  uint32 frame       = 1;
+  bytes  input_data  = 2;
+  string input_hash  = 3;
+}
+
+// ============================================================
+// 断线重连（新增）
+// ============================================================
+
+message PlayerReconnectMsg {
+  string conn_id     = 1;
+  string player_id   = 2;
+  string state       = 3; // disconnected, reconnected, timeout, waiting
+  uint32 timeout     = 4; // 重连窗口（秒）
+}
+
+message ReconnectResultMsg {
+  bool   success        = 1;
+  string reason         = 2; // timeout, no_saved_state, room_not_found
+  string room_id        = 3;
+  string player_id      = 4;
+  uint32 current_frame  = 5;
+  uint32 disconnected_frame = 6;
+  repeated FrameConfirmMsg missed_frames = 7;
+  RoomStateNotify room_state = 8;
+}
+
+message ReconnectRequestMsg {
+  string player_id   = 1;
+  string room_id     = 2;
+  uint32 last_frame  = 3;
+}
+
+// ============================================================
+// 延迟补偿/时间同步（新增）
+// ============================================================
+
+message TimeSyncReq {
+  uint64 client_send_time = 1;
+}
+
+message TimeSyncResp {
+  uint64 client_send_time    = 1;
+  uint64 server_receive_time = 2;
+  uint64 server_send_time    = 3;
 }

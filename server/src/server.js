@@ -7,6 +7,8 @@ const { v4: uuidv4 } = require('uuid');
 const { Connection } = require('./connection');
 const { RoomManager } = require('./room-manager');
 const { SyncManager } = require('./sync-manager');
+const { FrameSyncManager } = require('./frame-sync');
+const { ReconnectionManager } = require('./reconnection-manager');
 const { MessageHandler } = require('./message-handler');
 const { WechatAdapter } = require('./wechat-adapter');
 
@@ -27,6 +29,8 @@ class MiniLinkServer {
     this.connections = new Map(); // connId -> Connection
     this.roomManager = null;
     this.syncManager = null;
+    this.frameSyncManager = null;
+    this.reconnectionManager = null;
     this.messageHandler = null;
     this.wechatAdapter = null;
 
@@ -63,6 +67,8 @@ class MiniLinkServer {
     this.wechatAdapter = new WechatAdapter(this.wxConfig);
     this.roomManager = new RoomManager(this);
     this.syncManager = new SyncManager(this);
+    this.frameSyncManager = new FrameSyncManager(this);
+    this.reconnectionManager = new ReconnectionManager(this);
     this.messageHandler = new MessageHandler(this);
 
     // 创建 WebSocket 服务器
@@ -252,6 +258,8 @@ class MiniLinkServer {
       connections: this.connections.size,
       rooms: this.roomManager ? this.roomManager.getRoomCount() : 0,
       spawnedObjects: this.spawned.size,
+      frameSync: this.frameSyncManager ? this.frameSyncManager.getStats() : null,
+      reconnection: this.reconnectionManager ? this.reconnectionManager.getStats() : null,
       uptime: process.uptime(),
     };
   }

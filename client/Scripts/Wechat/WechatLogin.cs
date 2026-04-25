@@ -8,10 +8,30 @@ namespace MiniLink
     /// <summary>
     /// 微信登录组件
     /// 封装微信小程序登录流程（wx.login → 服务端code2Session）
+    /// 注意：此组件需要添加到场景中的 GameObject 上，名称必须为 "WechatLoginBridge"
     /// </summary>
     [AddComponentMenu("MiniLink/WechatLogin")]
     public class WechatLogin : MonoBehaviour
     {
+        #region Singleton Pattern
+        
+        /// <summary>单例实例（用于 JSLIB 回调）</summary>
+        public static WechatLogin singleton { get; private set; }
+        
+        private void Awake()
+        {
+            if (singleton != null && singleton != this)
+            {
+                Destroy(gameObject);
+                return;
+            }
+            singleton = this;
+            DontDestroyOnLoad(gameObject);
+            gameObject.name = "WechatLoginBridge"; // 确保名称正确，用于 SendMessage
+        }
+        
+        #endregion
+
         #region Events
 
         [Header("Events")]
