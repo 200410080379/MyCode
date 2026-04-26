@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -12,7 +13,7 @@ namespace MiniLink
     {
         private T value;
         private readonly Action<T, T> hook;
-        private readonly int dirtyBitIndex;
+        private int dirtyBitIndex;
         private NetworkBehaviour owner;
 
         /// <summary>当前值</summary>
@@ -48,7 +49,7 @@ namespace MiniLink
         public void Bind(NetworkBehaviour nb, int bitIndex)
         {
             owner = nb;
-            // dirtyBitIndex 在编译时由代码生成器分配
+            dirtyBitIndex = bitIndex;
         }
 
         private void SetDirty()

@@ -4,6 +4,8 @@
  */
 const { WebSocketServer } = require('ws');
 const { v4: uuidv4 } = require('uuid');
+const EventEmitter = require('events');
+const express = require('express');
 const { Connection } = require('./connection');
 const { RoomManager } = require('./room-manager');
 const { SyncManager } = require('./sync-manager');
@@ -11,9 +13,12 @@ const { FrameSyncManager } = require('./frame-sync');
 const { ReconnectionManager } = require('./reconnection-manager');
 const { MessageHandler } = require('./message-handler');
 const { WechatAdapter } = require('./wechat-adapter');
+const { Serializer, SerializeMode } = require('./serializer');
 
-class MiniLinkServer {
+class MiniLinkServer extends EventEmitter {
   constructor(options = {}) {
+    super();
+
     this.port = options.port || 9000;
     this.host = options.host || '0.0.0.0';
     this.heartbeatInterval = options.heartbeatInterval || 15000;
@@ -23,6 +28,9 @@ class MiniLinkServer {
     this.maxPlayersPerRoom = options.maxPlayersPerRoom || 4;
     this.syncRate = options.syncRate || 20;
     this.wxConfig = options.wx || {};
+
+    // #1: 序列化器（支持 JSON/Protobuf 切换）
+    this.serializer = new Serializer({ mode: options.serializeMode || SerializeMode.JSON });
 
     // 核心组件
     this.wss = null;
@@ -37,8 +45,9 @@ class MiniLinkServer {
     // 网络对象注册表（参考 Mirror NetworkServer.spawned）
     this.spawned = new Map(); // netId -> { connId, prefabHash, state }
 
-    // 序列号计数器
+    // 序列号计数器（#13: 分离 netId 和 seq 计数器）
     this._seq = 0;
+    this._netIdSeq = 0;
 
     // 心跳定时器
     this._heartbeatTimer = null;
@@ -52,6 +61,9 @@ class MiniLinkServer {
     // 事件回调
     this._onConnect = options.onConnect || null;
     this._onDisconnect = options.onDisconnect || null;
+
+    // #30: 统一的断线清理跟踪（替代分散的 setTimeout）
+    this._pendingCleanup = new Map(); // connId -> timeoutId
   }
 
   /**
@@ -91,6 +103,9 @@ class MiniLinkServer {
       console.error('[MiniLink] WebSocket 服务器错误:', err);
     });
 
+    // #20: 使用 express 提供健康检查和监控接口
+    this._startHttpServer();
+
     // 启动心跳检测
     this._heartbeatTimer = setInterval(() => {
       this._checkHeartbeats();
@@ -103,6 +118,34 @@ class MiniLinkServer {
     }, syncInterval);
 
     this.active = true;
+  }
+
+  /**
+   * #20: 启动 HTTP 健康检查服务
+   */
+  _startHttpServer() {
+    const app = express();
+    const httpPort = this.port + 1; // WebSocket 用 9000，HTTP 用 9001
+
+    // 健康检查
+    app.get('/health', (req, res) => {
+      res.json({
+        status: 'ok',
+        uptime: process.uptime(),
+        connections: this.connections.size,
+        rooms: this.roomManager ? this.roomManager.getRoomCount() : 0,
+        spawned: this.spawned.size,
+      });
+    });
+
+    // 统计信息
+    app.get('/stats', (req, res) => {
+      res.json(this.getStats());
+    });
+
+    this.httpServer = app.listen(httpPort, this.host, () => {
+      console.log(`[MiniLink] HTTP 监控服务启动 http://${this.host}:${httpPort}`);
+    });
   }
 
   /**
@@ -123,17 +166,33 @@ class MiniLinkServer {
       this._syncTimer = null;
     }
 
+    // #30: 清除所有待清理的断线超时
+    for (const [connId, timeoutId] of this._pendingCleanup) {
+      clearTimeout(timeoutId);
+    }
+    this._pendingCleanup.clear();
+
     // 关闭所有连接
     for (const [connId, conn] of this.connections) {
       conn.close('server_shutdown');
     }
     this.connections.clear();
 
+    // 关闭 HTTP 服务
+    if (this.httpServer) {
+      this.httpServer.close();
+      this.httpServer = null;
+    }
+
     // 关闭 WebSocket 服务器
     if (this.wss) {
       this.wss.close();
       this.wss = null;
     }
+
+    // 清理帧同步和重连管理器
+    if (this.frameSyncManager) this.frameSyncManager.destroy();
+    if (this.reconnectionManager) this.reconnectionManager.destroy();
 
     console.log('[MiniLink] 服务器已停止');
   }
@@ -166,6 +225,9 @@ class MiniLinkServer {
     });
 
     console.log(`[MiniLink] 新连接 ${connId} from ${clientAddr}`);
+
+    // 触发事件
+    this.emit('connect', conn);
   }
 
   /**
@@ -175,28 +237,55 @@ class MiniLinkServer {
     const conn = this.connections.get(connId);
     if (!conn) return;
 
-    // 通知房间管理器（保留重连窗口）
+    // #10: 在关闭前发送 Disconnect 消息通知客户端
+    // （如果连接还可用的话）
+    if (conn.ws && conn.ws.readyState === 1) {
+      try {
+        conn.send({
+          type: 4, // MSG_TYPE_DISCONNECT
+          seq: this.nextSeq(),
+          timestamp: Date.now(),
+          disconnect_msg: { reason: 'heartbeat_timeout' },
+        });
+      } catch (e) {
+        // 发送失败忽略
+      }
+    }
+
+    // 通知重连管理器（保留重连窗口）
+    this.reconnectionManager.onPlayerDisconnect(connId);
+
+    // 通知房间管理器（标记断线但暂不移除）
     this.roomManager.onPlayerDisconnect(connId);
 
-    // 标记断线时间（等待重连）
+    // 标记断线时间
     conn.disconnectedAt = Date.now();
 
-    // 延迟移除（给重连机会）
-    setTimeout(() => {
+    // #30: 统一延迟移除机制，避免和 ReconnectionManager 竞态
+    if (this._pendingCleanup.has(connId)) {
+      clearTimeout(this._pendingCleanup.get(connId));
+    }
+    const timeoutId = setTimeout(() => {
+      this._pendingCleanup.delete(connId);
       const c = this.connections.get(connId);
       if (c && c.disconnectedAt) {
         // 未重连，彻底移除
-        this.connections.delete(connId);
         this.roomManager.onPlayerRemove(connId);
+        this.connections.delete(connId);
         console.log(`[MiniLink] 连接彻底移除 ${connId}`);
       }
-    }, this.reconnectTTL);
+    }, this.reconnectTTL + 5000); // 比 ReconnectionManager 超时多5秒，确保重连逻辑先执行
+    this._pendingCleanup.set(connId, timeoutId);
+
+    // 触发事件
+    this.emit('disconnect', conn, code, reason);
 
     console.log(`[MiniLink] 连接断开 ${connId} code=${code} reason=${reason}`);
   }
 
   /**
    * 心跳检测
+   * #10: 超时前先发 Disconnect 消息
    */
   _checkHeartbeats() {
     const now = Date.now();
@@ -204,6 +293,14 @@ class MiniLinkServer {
       if (conn.disconnectedAt) continue; // 已断线等待重连
       if (now - conn.lastHeartbeat > this.heartbeatTimeout) {
         console.warn(`[MiniLink] 心跳超时，断开 ${connId}`);
+        // 先发 Disconnect 消息
+        conn.send({
+          type: 4,
+          seq: this.nextSeq(),
+          timestamp: Date.now(),
+          disconnect_msg: { reason: 'heartbeat_timeout' },
+        });
+        // 再关闭连接
         conn.close('heartbeat_timeout');
       }
     }
@@ -220,14 +317,16 @@ class MiniLinkServer {
 
   /**
    * 向房间内所有玩家广播
+   * #8/#26: 使用 Map 的 key(connId) 而非 PlayerInfo.connId 来避免 snake_case/camelCase 不一致
    */
   broadcastToRoom(roomId, message, excludeConnId = null) {
     const room = this.roomManager.getRoom(roomId);
     if (!room) return;
 
-    for (const player of room.players.values()) {
-      if (player.connId === excludeConnId) continue;
-      this.sendTo(player.connId, message);
+    for (const [connId, player] of room.players) {
+      if (connId === excludeConnId) continue;
+      if (player.disconnected) continue;
+      this.sendTo(connId, message);
     }
   }
 
@@ -247,6 +346,14 @@ class MiniLinkServer {
    */
   nextSeq() {
     return ++this._seq;
+  }
+
+  /**
+   * 生成下一个网络对象ID
+   * #13: 独立于 seq 的 netId 计数器，避免 ID 重叠
+   */
+  nextNetId() {
+    return ++this._netIdSeq;
   }
 
   /**

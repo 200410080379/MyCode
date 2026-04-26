@@ -76,37 +76,60 @@ namespace MiniLink
         /// <summary>
         /// 序列化脏SyncVar（子类重写）
         /// 参考 Mirror 的脏标记增量序列化
+        /// 
+        /// #5: 提供默认实现框架，子类只需 override 并填充具体字段
+        /// 示例：
+        /// <code>
+        /// internal override void SerializeSyncVars(NetworkWriter writer, bool initialState)
+        /// {
+        ///     base.SerializeSyncVars(writer, initialState);
+        ///     if (initialState || IsDirty(0))
+        ///         writer.WriteInt(health);
+        ///     if (initialState || IsDirty(1))
+        ///         writer.WriteString(playerName);
+        /// }
+        /// </code>
         /// </summary>
-        /// <param name="writer">写入器</param>
-        /// <param name="initialState">是否全量序列化（首次生成时）</param>
         internal virtual void SerializeSyncVars(NetworkWriter writer, bool initialState)
         {
-            // 子类实现示例：
-            // if (initialState || IsDirty(0))
-            //     writer.WriteString(mySyncVar1);
-            // if (initialState || IsDirty(1))
-            //     writer.WriteFloat(mySyncVar2);
+            // 基类空实现，子类 override 时必须先调用 base.SerializeSyncVars(writer, initialState)
         }
 
         /// <summary>
         /// 反序列化SyncVar（子类重写）
+        /// 
+        /// #5: 提供默认实现框架，子类只需 override 并填充具体字段
+        /// 示例：
+        /// <code>
+        /// internal override void DeserializeSyncVars(NetworkReader reader, bool initialState)
+        /// {
+        ///     base.DeserializeSyncVars(reader, initialState);
+        ///     if (initialState || IsDirty(0))
+        ///     {
+        ///         int oldHealth = health;
+        ///         health = reader.ReadInt();
+        ///         if (!initialState && oldHealth != health)
+        ///             OnHealthChanged(oldHealth, health);
+        ///     }
+        ///     if (initialState || IsDirty(1))
+        ///     {
+        ///         string oldName = playerName;
+        ///         playerName = reader.ReadString();
+        ///         if (!initialState && oldName != playerName)
+        ///             OnNameChanged(oldName, playerName);
+        ///     }
+        /// }
+        /// </code>
         /// </summary>
         internal virtual void DeserializeSyncVars(NetworkReader reader, bool initialState)
         {
-            // 子类实现示例：
-            // if (initialState || IsDirty(0))
-            // {
-            //     string oldVal = mySyncVar1;
-            //     mySyncVar1 = reader.ReadString();
-            //     if (!initialState && mySyncVar1 != oldVal)
-            //         OnMySyncVar1Changed(oldVal, mySyncVar1);
-            // }
+            // 基类空实现，子类 override 时必须先调用 base.DeserializeSyncVars(reader, initialState)
         }
 
         /// <summary>
         /// 标记脏位
         /// </summary>
-        protected void SetDirtyBit(int bitIndex)
+        protected internal void SetDirtyBit(int bitIndex)
         {
             componentDirtyMask |= (1UL << bitIndex);
             if (netIdentity != null)
@@ -265,6 +288,104 @@ namespace MiniLink
 
         /// <summary>SyncVar变更时调用（通用版本）</summary>
         public virtual void OnSyncVarChanged(string varName, object oldValue, object newValue) { }
+
+        #endregion
+
+        #region RPC Invocation (#3)
+
+        /// <summary>
+        /// #3: RPC 方法注册表（methodHash -> 反射方法缓存）
+        /// 子类在 OnStartClient 中注册
+        /// </summary>
+        private static readonly Dictionary<string, System.Reflection.MethodInfo> _rpcMethodCache
+            = new Dictionary<string, System.Reflection.MethodInfo>();
+
+        /// <summary>
+        /// #3: 尝试通过反射调用 RPC 方法
+        /// 由 NetworkClient.InvokeRpc 调用
+        /// </summary>
+        internal bool TryInvokeRpc(string methodHash, byte[] args)
+        {
+            // 查找带 [ClientRpc] 或 [TargetRpc] 标记的方法
+            var type = GetType();
+            var cacheKey = $"{type.FullName}.{methodHash}";
+
+            if (!_rpcMethodCache.TryGetValue(cacheKey, out var method))
+            {
+                // 首次调用时通过反射查找
+                foreach (var m in type.GetMethods(
+                    System.Reflection.BindingFlags.Instance |
+                    System.Reflection.BindingFlags.Public |
+                    System.Reflection.BindingFlags.NonPublic))
+                {
+                    var attr = m.GetCustomAttributes(false);
+                    foreach (var a in attr)
+                    {
+                        var attrType = a.GetType();
+                        if (attrType.Name == "ClientRpcAttribute" || attrType.Name == "TargetRpcAttribute")
+                        {
+                            var hashField = attrType.GetField("methodHash");
+                            var hash = hashField != null ? hashField.GetValue(a)?.ToString() : m.Name.GetHashCode().ToString();
+                            if (hash == methodHash)
+                            {
+                                method = m;
+                                _rpcMethodCache[cacheKey] = m;
+                                break;
+                            }
+                        }
+                    }
+                    if (method != null) break;
+                }
+            }
+
+            if (method == null) return false;
+
+            try
+            {
+                // 简化参数解析：直接传 NetworkReader
+                using (var reader = new NetworkReader(args))
+                {
+                    var parameters = method.GetParameters();
+                    var invokeArgs = new object[parameters.Length];
+
+                    for (int i = 0; i < parameters.Length; i++)
+                    {
+                        if (parameters[i].ParameterType == typeof(NetworkReader))
+                        {
+                            invokeArgs[i] = reader;
+                        }
+                        else
+                        {
+                            invokeArgs[i] = ReadTypedValue(reader, parameters[i].ParameterType);
+                        }
+                    }
+
+                    method.Invoke(this, invokeArgs);
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[MiniLink] RPC反射调用失败: {methodHash}, {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 从 NetworkReader 读取指定类型的值
+        /// </summary>
+        private object ReadTypedValue(NetworkReader reader, Type type)
+        {
+            if (type == typeof(int)) return reader.ReadInt();
+            if (type == typeof(float)) return reader.ReadFloat();
+            if (type == typeof(bool)) return reader.ReadBool();
+            if (type == typeof(string)) return reader.ReadString();
+            if (type == typeof(Vector3)) return reader.ReadVector3();
+            if (type == typeof(Vector2)) return reader.ReadVector2();
+            if (type == typeof(Quaternion)) return reader.ReadQuaternion();
+            if (type == typeof(byte[])) return reader.ReadBytes();
+            return null;
+        }
 
         #endregion
 

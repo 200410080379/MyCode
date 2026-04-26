@@ -56,8 +56,8 @@ class ReconnectionManager {
       playerNetId: conn.playerNetId,
       nickname: conn.nickname,
       avatarUrl: conn.avatarUrl,
-      isReady: player.isReady,
-      isHost: player.isHost,
+      isReady: player.is_ready,
+      isHost: player.is_host,
       
       // 断线时状态快照
       disconnectedAt: Date.now(),
@@ -85,7 +85,7 @@ class ReconnectionManager {
         conn_id: connId,
         player_id: conn.playerId,
         state: 'disconnected',
-        timeout: this.reconnectTimeout,
+        timeout: Math.floor(this.reconnectTimeout / 1000),
       },
     }, connId);
     
@@ -131,13 +131,28 @@ class ReconnectionManager {
     newConn.isReconnecting = true;
     
     // 更新房间中的玩家映射
+    const existingPlayer = room.players.get(connId);
     room.players.delete(connId);
     room.players.set(newConnId, {
-      isReady: reconnState.isReady,
-      isHost: reconnState.isHost,
+      ...(existingPlayer || {}),
+      conn_id: newConnId,
+      player_id: reconnState.playerId,
+      nickname: reconnState.nickname,
+      avatar_url: reconnState.avatarUrl,
+      is_ready: reconnState.isReady,
+      is_host: reconnState.isHost,
       disconnected: false,
+      disconnectedAt: null,
       reconnectDeadline: null,
     });
+    this.server.roomManager.playerRoomMap.delete(connId);
+    this.server.roomManager.playerRoomMap.set(newConnId, reconnState.roomId);
+
+    if (room.hostId === connId) {
+      room.hostId = newConnId;
+    }
+
+    this.server.connections.delete(connId);
     
     // 通知房间内其他玩家
     this.server.broadcastToRoom(reconnState.roomId, {
@@ -166,7 +181,7 @@ class ReconnectionManager {
         current_frame: currentFrame,
         disconnected_frame: reconnState.disconnectedFrame,
         missed_frames: reconnState.frameCache,
-        room_state: this._serializeRoomState(room),
+        room_state: this.server.roomManager._roomToNotify(room),
       },
     });
     
@@ -223,9 +238,13 @@ class ReconnectionManager {
     const players = [];
     for (const [connId, player] of room.players) {
       players.push({
+        player_id: player.player_id,
+        nickname: player.nickname,
+        avatar_url: player.avatar_url,
+        slot_index: player.slot_index,
         connected: !player.disconnected,
-        is_ready: player.isReady,
-        is_host: player.isHost,
+        is_ready: player.is_ready,
+        is_host: player.is_host,
       });
     }
     
@@ -246,8 +265,6 @@ class ReconnectionManager {
     // 从房间中移除玩家
     const room = this.server.roomManager.getRoom(state.roomId);
     if (room) {
-      room.players.delete(connId);
-      
       // 通知其他玩家
       this.server.broadcastToRoom(state.roomId, {
         type: 80,
@@ -259,10 +276,15 @@ class ReconnectionManager {
           state: 'timeout',
         },
       });
-      
-      // 通知帧同步管理器
-      if (this.server.frameSyncManager) {
-        this.server.frameSyncManager.playerLeave(state.roomId, connId);
+
+      const leaveResult = this.server.roomManager.leaveRoom(connId);
+      if (!leaveResult.error && !leaveResult.dismissed && leaveResult.room) {
+        this.server.broadcastToRoom(state.roomId, {
+          type: 17,
+          seq: this.server.nextSeq(),
+          timestamp: Date.now(),
+          room_state_notify: leaveResult.room,
+        });
       }
     }
     

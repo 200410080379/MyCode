@@ -27,6 +27,9 @@ namespace MiniLink
         /// <summary>连接ID</summary>
         public static string connectionId => connection?.connectionId;
 
+        /// <summary>玩家ID（握手后默认为clientId，登录后切换为openid）</summary>
+        public static string playerId => connection?.playerId;
+
         #endregion
 
         #region Internal Fields
@@ -46,6 +49,9 @@ namespace MiniLink
         /// <summary>传输层</summary>
         private static ITransport transport;
 
+        /// <summary>运行时驱动（心跳/时间同步）</summary>
+        private static NetworkClientRuntime runtime;
+
         #endregion
 
         #region Connection
@@ -61,6 +67,8 @@ namespace MiniLink
                 return;
             }
 
+            DetachTransportHandlers();
+
             // 创建传输层（根据平台自动选择）
             transport = CreateTransport();
             transport.OnConnected += OnConnected;
@@ -69,6 +77,8 @@ namespace MiniLink
 
             connection = new NetworkConnection();
             connection.serverUrl = serverUrl;
+            runtime = GetOrCreateBehaviourComponent<NetworkClientRuntime>("NetworkClientRuntime");
+            runtime.ResetTimers();
 
             Debug.Log($"[MiniLink] 连接中: {serverUrl}");
             transport.Connect(serverUrl);
@@ -96,12 +106,46 @@ namespace MiniLink
         private static ITransport CreateTransport()
         {
 #if UNITY_WEBGL && !UNITY_EDITOR
-            // WebGL/微信小程序环境
-            return new WxWebSocketTransport();
+            var douyinTransport = TtWebSocketTransport.singleton ??
+                UnityEngine.Object.FindObjectOfType<TtWebSocketTransport>();
+            if (douyinTransport != null)
+            {
+                return douyinTransport;
+            }
+
+            return GetOrCreateTransportComponent<WxWebSocketTransport>("WxWebSocketBridge");
 #else
             // 原生环境
             return new WebSocketTransport();
 #endif
+        }
+
+        private static T GetOrCreateTransportComponent<T>(string objectName)
+            where T : MonoBehaviour, ITransport
+        {
+            var existing = UnityEngine.Object.FindObjectOfType<T>();
+            if (existing != null)
+            {
+                return existing;
+            }
+
+            var go = new GameObject(objectName);
+            UnityEngine.Object.DontDestroyOnLoad(go);
+            return go.AddComponent<T>();
+        }
+
+        private static T GetOrCreateBehaviourComponent<T>(string objectName)
+            where T : MonoBehaviour
+        {
+            var existing = UnityEngine.Object.FindObjectOfType<T>();
+            if (existing != null)
+            {
+                return existing;
+            }
+
+            var go = new GameObject(objectName);
+            UnityEngine.Object.DontDestroyOnLoad(go);
+            return go.AddComponent<T>();
         }
 
         #endregion
@@ -120,13 +164,21 @@ namespace MiniLink
         private static void OnDisconnected()
         {
             Debug.Log("[MiniLink] 连接断开");
-            connection.isConnected = false;
-            connection.isAuthenticated = false;
+            if (connection != null)
+            {
+                connection.isConnected = false;
+                connection.isAuthenticated = false;
+            }
 
             // 通知所有对象断开
             foreach (var identity in spawnedObjects.Values)
             {
                 identity.NotifyDestroy();
+            }
+
+            if (ReconnectionManager.singleton != null)
+            {
+                ReconnectionManager.singleton.OnConnectionLost();
             }
         }
 
@@ -136,10 +188,22 @@ namespace MiniLink
             {
                 // 解析JSON消息
                 string json = System.Text.Encoding.UTF8.GetString(data);
-                var msg = MiniJson.Deserialize(json) as Dictionary<string, object>;
-                if (msg == null) return;
+                var parsed = MiniJson.Deserialize(json);
 
-                ProcessMessage(msg);
+                if (parsed is Dictionary<string, object> msg)
+                {
+                    ProcessMessage(msg);
+                }
+                else if (parsed is List<object> batch)
+                {
+                    foreach (var item in batch)
+                    {
+                        if (item is Dictionary<string, object> batchedMsg)
+                        {
+                            ProcessMessage(batchedMsg);
+                        }
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -163,6 +227,10 @@ namespace MiniLink
 
                 case 3: // HEARTBEAT
                     ProcessHeartbeat(msg);
+                    break;
+
+                case 14: // ROOM_LIST_RESP
+                    ProcessRoomList(msg);
                     break;
 
                 case 17: // ROOM_STATE_NOTIFY
@@ -197,8 +265,36 @@ namespace MiniLink
                     ProcessDespawn(msg);
                     break;
 
+                case 61: // WX_LOGIN_RESP
+                    ProcessWxLoginResp(msg);
+                    break;
+
+                case 70: // FRAME_PAUSE
+                    ProcessFramePause(msg);
+                    break;
+
+                case 71: // FRAME_CONFIRM
+                    ProcessFrameConfirm(msg);
+                    break;
+
+                case 80: // RECONNECT_STATE
+                    ProcessReconnectState(msg);
+                    break;
+
+                case 81: // RECONNECT_RESULT
+                    ProcessReconnectResult(msg);
+                    break;
+
+                case 91: // TIME_SYNC_RESP
+                    ProcessTimeSyncResp(msg);
+                    break;
+
                 case 99: // ERROR_MSG
                     ProcessError(msg);
+                    break;
+
+                default:
+                    Debug.LogWarning($"[MiniLink] 未处理的消息类型: {msgType}");
                     break;
             }
         }
@@ -213,7 +309,11 @@ namespace MiniLink
             {
                 connection.isAuthenticated = true;
                 connection.sessionId = resp["session_id"] as string;
-                connection.reconnectToken = resp["reconnect_token"] as string;
+                connection.reconnectToken = GetString(resp, "reconnect_token", connection.sessionId);
+                connection.connectionId = GetString(resp, "conn_id", connection.connectionId);
+                connection.playerId = GetString(resp, "player_id", connection.playerId);
+                runtime?.ResetTimers();
+                ReconnectionManager.singleton?.EnableHeartbeat();
                 Debug.Log($"[MiniLink] 认证成功, sessionId={connection.sessionId}");
             }
             else
@@ -227,9 +327,22 @@ namespace MiniLink
             var hb = msg["heartbeat"] as Dictionary<string, object>;
             if (hb == null) return;
 
-            long clientTime = Convert.ToInt64(hb["client_time"]);
             int pingMs = Convert.ToInt32(hb["ping_ms"]);
             connection.UpdatePing(pingMs);
+
+            ReconnectionManager.singleton?.OnHeartbeatReceived();
+            LagCompensationManager.singleton?.RecordRttSample(pingMs);
+        }
+
+        private static void ProcessRoomList(Dictionary<string, object> msg)
+        {
+            var roomListResp = msg["room_list_resp"] as Dictionary<string, object>;
+            if (roomListResp == null) return;
+
+            if (NetworkRoomManager.singleton != null)
+            {
+                NetworkRoomManager.OnRoomListResponse(roomListResp);
+            }
         }
 
         private static void ProcessSyncVar(Dictionary<string, object> msg)
@@ -245,10 +358,12 @@ namespace MiniLink
                 return;
             }
 
-            string component = syncMsg["component"] as string;
             int dirtyMask = Convert.ToInt32(syncMsg["dirty_mask"]);
-            string payloadBase64 = syncMsg["payload"] as string;
-            byte[] payload = Convert.FromBase64String(payloadBase64);
+            byte[] payload = DecodePayload(syncMsg["payload"]);
+
+            if (payload == null || payload.Length == 0) return;
+
+            ApplyDirtyMask(identity, dirtyMask);
 
             using (var reader = new NetworkReader(payload))
             {
@@ -256,6 +371,7 @@ namespace MiniLink
             }
 
             identity.ClearDirtyMask((ulong)dirtyMask);
+            ClearDirtyMask(identity);
         }
 
         private static void ProcessSnapshot(Dictionary<string, object> msg)
@@ -269,8 +385,7 @@ namespace MiniLink
 
             long remoteTick = Convert.ToInt64(snapMsg["remote_tick"]);
             float remoteTime = Convert.ToSingle(snapMsg["remote_time"]);
-            string payloadBase64 = snapMsg["state_data"] as string;
-            byte[] payload = Convert.FromBase64String(payloadBase64);
+            byte[] payload = DecodePayload(snapMsg["state_data"]);
 
             // 交给 SnapshotInterpolation 处理
             SnapshotInterpolation.AddSnapshot(netId, remoteTick, remoteTime, payload);
@@ -284,8 +399,7 @@ namespace MiniLink
             uint netId = Convert.ToUInt32(rpcMsg["net_id"]);
             string methodHash = rpcMsg["method_hash"] as string;
             bool includeOwner = Convert.ToBoolean(rpcMsg["include_owner"]);
-            string argsBase64 = rpcMsg["args"] as string;
-            byte[] args = Convert.FromBase64String(argsBase64);
+            byte[] args = DecodePayload(rpcMsg["args"]);
 
             var identity = GetSpawnedObject(netId);
             if (identity == null) return;
@@ -304,8 +418,7 @@ namespace MiniLink
 
             uint netId = Convert.ToUInt32(rpcMsg["net_id"]);
             string methodHash = rpcMsg["method_hash"] as string;
-            string argsBase64 = rpcMsg["args"] as string;
-            byte[] args = Convert.FromBase64String(argsBase64);
+            byte[] args = DecodePayload(rpcMsg["args"]);
 
             var identity = GetSpawnedObject(netId);
             if (identity == null) return;
@@ -322,7 +435,7 @@ namespace MiniLink
             int prefabHash = Convert.ToInt32(spawnMsg["prefab_hash"]);
             string ownerConnId = spawnMsg["owner_conn_id"] as string;
             string stateBase64 = spawnMsg["initial_state"] as string;
-            byte[] initialState = string.IsNullOrEmpty(stateBase64) ? null : Convert.FromBase64String(stateBase64);
+            byte[] initialState = DecodePayload(stateBase64);
 
             SpawnObject(netId, prefabHash, ownerConnId, initialState);
         }
@@ -344,6 +457,7 @@ namespace MiniLink
             string code = errMsg["code"] as string;
             string message = errMsg["message"] as string;
             Debug.LogError($"[MiniLink] 服务器错误: {code} - {message}");
+            NetworkRoomManager.OnServerError(string.IsNullOrEmpty(message) ? code : message);
         }
 
         private static void ProcessRoomState(Dictionary<string, object> msg)
@@ -366,6 +480,120 @@ namespace MiniLink
         {
             // 客户端收到的Command通常是服务端的响应
             // 这里简化处理，实际可扩展为双向RPC
+        }
+
+        private static void ProcessWxLoginResp(Dictionary<string, object> msg)
+        {
+            var loginResp = msg["wx_login_resp"] as Dictionary<string, object>;
+            if (loginResp == null) return;
+
+            bool success = loginResp.TryGetValue("success", out var successObj) &&
+                Convert.ToBoolean(successObj);
+
+            if (success)
+            {
+                string token = GetString(loginResp, "token");
+                string openid = GetString(loginResp, "openid");
+                string sessionKey = GetString(loginResp, "session_key");
+
+                connection.isAuthenticated = true;
+                connection.playerId = openid;
+
+                if (WechatLogin.singleton != null)
+                {
+                    WechatLogin.singleton.OnServerLoginSuccess(token, openid, sessionKey);
+                }
+                else if (DouyinLogin.singleton != null)
+                {
+                    DouyinLogin.singleton.OnServerLoginSuccess(token, openid, sessionKey);
+                }
+            }
+            else
+            {
+                connection.isAuthenticated = false;
+                const string fallbackMessage = "登录失败";
+                if (WechatLogin.singleton != null)
+                {
+                    WechatLogin.singleton.HandleLoginFailed(fallbackMessage);
+                }
+                else if (DouyinLogin.singleton != null)
+                {
+                    DouyinLogin.singleton.HandleLoginFailed(fallbackMessage);
+                }
+            }
+        }
+
+        private static void ProcessFramePause(Dictionary<string, object> msg)
+        {
+            var pauseMsg = msg["frame_pause_msg"] as Dictionary<string, object>;
+            if (pauseMsg == null || FrameSyncManager.singleton == null) return;
+
+            bool paused = pauseMsg.TryGetValue("paused", out var pausedObj) &&
+                Convert.ToBoolean(pausedObj);
+            FrameSyncManager.singleton.SetPaused(paused);
+        }
+
+        private static void ProcessFrameConfirm(Dictionary<string, object> msg)
+        {
+            var confirmMsg = msg["frame_confirm_msg"] as Dictionary<string, object>;
+            if (confirmMsg == null || FrameSyncManager.singleton == null) return;
+
+            long frame = confirmMsg.TryGetValue("frame", out var frameObj)
+                ? Convert.ToInt64(frameObj)
+                : 0;
+
+            var inputs = new Dictionary<uint, byte[]>();
+            if (confirmMsg.TryGetValue("inputs", out var inputsObj) && inputsObj is List<object> inputList)
+            {
+                foreach (var entry in inputList)
+                {
+                    if (entry is Dictionary<string, object> inputDict)
+                    {
+                        uint netId = inputDict.TryGetValue("net_id", out var netIdObj)
+                            ? Convert.ToUInt32(netIdObj)
+                            : 0;
+                        byte[] inputData = DecodePayload(
+                            inputDict.TryGetValue("input_data", out var inputObj) ? inputObj : null
+                        );
+                        inputs[netId] = inputData ?? Array.Empty<byte>();
+                    }
+                }
+            }
+
+            FrameSyncManager.singleton.OnFrameConfirm(frame, inputs);
+        }
+
+        private static void ProcessReconnectState(Dictionary<string, object> msg)
+        {
+            ReconnectionManager.singleton?.OnReconnectState(msg);
+        }
+
+        private static void ProcessReconnectResult(Dictionary<string, object> msg)
+        {
+            ReconnectionManager.singleton?.OnReconnectResult(msg);
+        }
+
+        private static void ProcessTimeSyncResp(Dictionary<string, object> msg)
+        {
+            var timeSyncResp = msg["time_sync_resp"] as Dictionary<string, object>;
+            if (timeSyncResp == null || LagCompensationManager.singleton == null) return;
+
+            long clientSendTime = timeSyncResp.TryGetValue("client_send_time", out var sendObj)
+                ? Convert.ToInt64(sendObj)
+                : 0;
+            long serverReceiveTime = timeSyncResp.TryGetValue("server_receive_time", out var receiveObj)
+                ? Convert.ToInt64(receiveObj)
+                : 0;
+            long serverSendTime = timeSyncResp.TryGetValue("server_send_time", out var serverSendObj)
+                ? Convert.ToInt64(serverSendObj)
+                : 0;
+
+            LagCompensationManager.singleton.RecordTimestampSample(
+                clientSendTime,
+                serverReceiveTime,
+                serverSendTime,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            );
         }
 
         #endregion
@@ -392,15 +620,19 @@ namespace MiniLink
                 return;
             }
 
+            GameObject go;
+            NetworkIdentity identity;
             if (!prefabs.TryGetValue(prefabHash, out var prefab))
             {
-                Debug.LogError($"[MiniLink] 未注册的预制体: hash={prefabHash}");
-                return;
+                go = new GameObject($"MiniLink_NetworkObject_{netId}");
+                identity = go.AddComponent<NetworkIdentity>();
+                Debug.LogWarning($"[MiniLink] 未注册的预制体: hash={prefabHash}，已创建占位对象");
             }
-
-            // 实例化
-            var go = UnityEngine.Object.Instantiate(prefab.gameObject);
-            var identity = go.GetComponent<NetworkIdentity>();
+            else
+            {
+                go = UnityEngine.Object.Instantiate(prefab.gameObject);
+                identity = go.GetComponent<NetworkIdentity>();
+            }
 
             identity.netId = netId;
             identity.ownerConnId = ownerConnId;
@@ -478,6 +710,9 @@ namespace MiniLink
         /// </summary>
         private static void SendHandshake()
         {
+            string clientId = SystemInfo.deviceUniqueIdentifier;
+            connection.playerId = clientId;
+
             var msg = new Dictionary<string, object>
             {
                 ["type"] = 1,
@@ -485,7 +720,7 @@ namespace MiniLink
                 ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 ["handshake_req"] = new Dictionary<string, object>
                 {
-                    ["client_id"] = SystemInfo.deviceUniqueIdentifier,
+                    ["client_id"] = clientId,
                     ["version"] = "1.0.0",
                 }
             };
@@ -683,37 +918,201 @@ namespace MiniLink
             rpcHandlers[methodHash] = handler;
         }
 
+        /// <summary>
+        /// #3: RPC 调用分发 — 完整实现
+        /// 根据 methodHash 查找注册的 handler 并实际调用
+        /// 支持无参、单参、双参、三参、四参的 Action 委托
+        /// </summary>
         private static void InvokeRpc(NetworkIdentity identity, string methodHash, byte[] args)
         {
-            // 这里简化实现，实际应用中应使用代码生成或反射
-            // Mirror的做法是在编译时生成RPC代码
-            Debug.Log($"[MiniLink] 收到RPC: {methodHash}, netId={identity.netId}");
-
             if (rpcHandlers.TryGetValue(methodHash, out var handler))
             {
-                // 解析参数并调用
-                // 实际实现需要根据方法签名解析
+                try
+                {
+                    // 解析参数
+                    object[] parsedArgs = ParseRpcArgs(args);
+
+                    // 根据委托类型动态调用
+                    switch (handler)
+                    {
+                        case Action action when parsedArgs.Length == 0:
+                            action();
+                            break;
+                        case Action<NetworkReader> readerAction:
+                            // 最常用模式：直接传 NetworkReader 让业务层自己读
+                            using (var reader = new NetworkReader(args))
+                            {
+                                readerAction(reader);
+                            }
+                            break;
+                        default:
+                            // 尝试 DynamicInvoke
+                            handler.DynamicInvoke(parsedArgs);
+                            break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError($"[MiniLink] RPC调用异常: {methodHash}, {ex.Message}");
+                }
             }
+            else
+            {
+                // 没有注册的 handler，通知 NetworkBehaviour 尝试匹配
+                if (identity.networkBehaviours != null)
+                {
+                    foreach (var nb in identity.networkBehaviours)
+                    {
+                        if (nb != null && nb.TryInvokeRpc(methodHash, args))
+                            return;
+                    }
+                }
+                Debug.LogWarning($"[MiniLink] 未注册的RPC: {methodHash}");
+            }
+        }
+
+        /// <summary>
+        /// 解析 RPC 参数字节流
+        /// </summary>
+        private static object[] ParseRpcArgs(byte[] args)
+        {
+            if (args == null || args.Length == 0) return Array.Empty<object>();
+
+            var result = new List<object>();
+            using (var reader = new NetworkReader(args))
+            {
+                while (reader.Position < reader.Length)
+                {
+                    byte typeCode = reader.ReadByte();
+                    switch (typeCode)
+                    {
+                        case 0: result.Add(null); break;
+                        case 1: result.Add(reader.ReadInt()); break;
+                        case 2: result.Add(reader.ReadFloat()); break;
+                        case 3: result.Add(reader.ReadBool()); break;
+                        case 4: result.Add(reader.ReadString()); break;
+                        case 5: result.Add(reader.ReadVector3()); break;
+                        case 6: result.Add(reader.ReadVector2()); break;
+                        case 7: result.Add(reader.ReadQuaternion()); break;
+                        case 8: result.Add(reader.ReadBytes()); break;
+                        default:
+                            Debug.LogWarning($"[MiniLink] 未知RPC参数类型: {typeCode}");
+                            return result.ToArray();
+                    }
+                }
+            }
+            return result.ToArray();
         }
 
         #endregion
 
         #region Cleanup
 
+        /// <summary>
+        /// #7: 清理时重置所有 static 状态，防止脏数据残留
+        /// </summary>
         private static void Cleanup()
         {
             spawnedObjects.Clear();
             localPlayer = null;
 
-            if (transport != null)
-            {
-                transport.OnConnected -= OnConnected;
-                transport.OnDisconnected -= OnDisconnected;
-                transport.OnDataReceived -= OnDataReceived;
-                transport = null;
-            }
+            // #7: 清理 RPC 和消息处理器，避免跨场景残留
+            rpcHandlers.Clear();
+            messageHandlers.Clear();
+            prefabs.Clear();
+
+            // #7: 清理插值缓冲
+            SnapshotInterpolation.Clear();
+
+            DetachTransportHandlers();
+            transport = null;
+            runtime?.ResetTimers();
 
             connection = null;
+        }
+
+        private static void DetachTransportHandlers()
+        {
+            if (transport == null) return;
+
+            transport.OnConnected -= OnConnected;
+            transport.OnDisconnected -= OnDisconnected;
+            transport.OnDataReceived -= OnDataReceived;
+        }
+
+        private static void ApplyDirtyMask(NetworkIdentity identity, int dirtyMask)
+        {
+            if (identity.networkBehaviours == null) return;
+
+            foreach (var behaviour in identity.networkBehaviours)
+            {
+                if (behaviour != null)
+                {
+                    behaviour.componentDirtyMask = (ulong)dirtyMask;
+                }
+            }
+        }
+
+        private static void ClearDirtyMask(NetworkIdentity identity)
+        {
+            if (identity.networkBehaviours == null) return;
+
+            foreach (var behaviour in identity.networkBehaviours)
+            {
+                if (behaviour != null)
+                {
+                    behaviour.componentDirtyMask = 0;
+                }
+            }
+        }
+
+        private static byte[] DecodePayload(object value)
+        {
+            if (value == null)
+            {
+                return null;
+            }
+
+            if (value is string stringValue)
+            {
+                if (string.IsNullOrEmpty(stringValue))
+                {
+                    return null;
+                }
+
+                try
+                {
+                    return Convert.FromBase64String(stringValue);
+                }
+                catch (FormatException)
+                {
+                    Debug.LogWarning("[MiniLink] 收到非Base64编码数据，已按UTF8处理");
+                    return System.Text.Encoding.UTF8.GetBytes(stringValue);
+                }
+            }
+
+            if (value is Dictionary<string, object> dict &&
+                dict.TryGetValue("type", out var typeObj) &&
+                typeObj?.ToString() == "Buffer" &&
+                dict.TryGetValue("data", out var dataObj) &&
+                dataObj is List<object> dataList)
+            {
+                var bytes = new byte[dataList.Count];
+                for (int i = 0; i < dataList.Count; i++)
+                {
+                    bytes[i] = Convert.ToByte(dataList[i]);
+                }
+                return bytes;
+            }
+
+            return System.Text.Encoding.UTF8.GetBytes(value.ToString());
+        }
+
+        private static string GetString(Dictionary<string, object> dict, string key, string fallback = "")
+        {
+            return dict != null && dict.TryGetValue(key, out var value) && value != null
+                ? value.ToString()
+                : fallback;
         }
 
         #endregion
@@ -728,6 +1127,7 @@ namespace MiniLink
         public string serverUrl { get; set; }
         public string sessionId { get; set; }
         public string reconnectToken { get; set; }
+        public string playerId { get; set; }
         public bool isConnected { get; set; }
         public bool isAuthenticated { get; set; }
         public int pingMs { get; private set; }
@@ -757,5 +1157,40 @@ namespace MiniLink
         void Connect(string url);
         void Disconnect();
         void Send(byte[] data);
+    }
+
+    public class NetworkClientRuntime : MonoBehaviour
+    {
+        [SerializeField] private float heartbeatInterval = 2f;
+        [SerializeField] private float timeSyncInterval = 10f;
+
+        private float heartbeatTimer;
+        private float timeSyncTimer;
+
+        public void ResetTimers()
+        {
+            heartbeatTimer = 0f;
+            timeSyncTimer = 0f;
+        }
+
+        private void Update()
+        {
+            if (!NetworkClient.isConnected) return;
+
+            heartbeatTimer += Time.unscaledDeltaTime;
+            timeSyncTimer += Time.unscaledDeltaTime;
+
+            if (heartbeatTimer >= heartbeatInterval)
+            {
+                heartbeatTimer = 0f;
+                NetworkClient.SendHeartbeat();
+            }
+
+            if (timeSyncTimer >= timeSyncInterval)
+            {
+                timeSyncTimer = 0f;
+                NetworkClient.SendTimeSync();
+            }
+        }
     }
 }

@@ -140,15 +140,23 @@ namespace MiniLink
 
         #region Receive Loop
 
+        /// <summary>
+        /// #11: 修复大消息接收 — 处理 EndOfMessage == false 的情况
+        /// 当消息超过 ReceiveBufferSize 时，WebSocket 会分多帧发送
+        /// 需要拼接完整消息后再回调
+        /// </summary>
         private async Task ReceiveLoop()
         {
             var buffer = new byte[ReceiveBufferSize];
-            var receiveBuffer = new ArraySegment<byte>(buffer);
+            // 用于拼接大消息的 MemoryStream
+            var messageStream = new System.IO.MemoryStream();
+            bool isBuildingMessage = false;
 
             try
             {
                 while (socket.State == WebSocketState.Open && !cts.IsCancellationRequested)
                 {
+                    var receiveBuffer = new ArraySegment<byte>(buffer);
                     var result = await socket.ReceiveAsync(receiveBuffer, cts.Token);
 
                     if (result.MessageType == WebSocketMessageType.Close)
@@ -160,10 +168,32 @@ namespace MiniLink
 
                     if (result.Count > 0)
                     {
-                        // 复制数据到新数组
-                        var data = new byte[result.Count];
-                        Array.Copy(buffer, 0, data, 0, result.Count);
-                        OnDataReceived?.Invoke(data);
+                        // #11: 检查是否是完整消息
+                        if (result.EndOfMessage)
+                        {
+                            if (isBuildingMessage)
+                            {
+                                // 大消息的最后一帧
+                                messageStream.Write(buffer, 0, result.Count);
+                                var data = messageStream.ToArray();
+                                OnDataReceived?.Invoke(data);
+                                messageStream.SetLength(0);
+                                isBuildingMessage = false;
+                            }
+                            else
+                            {
+                                // 普通小消息，直接回调
+                                var data = new byte[result.Count];
+                                Array.Copy(buffer, 0, data, 0, result.Count);
+                                OnDataReceived?.Invoke(data);
+                            }
+                        }
+                        else
+                        {
+                            // 大消息的中间帧，拼接
+                            messageStream.Write(buffer, 0, result.Count);
+                            isBuildingMessage = true;
+                        }
                     }
                 }
             }
@@ -175,6 +205,10 @@ namespace MiniLink
             {
                 Debug.LogError($"[WebSocket] 接收异常: {ex.Message}");
                 HandleDisconnection();
+            }
+            finally
+            {
+                messageStream?.Dispose();
             }
         }
 

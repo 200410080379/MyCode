@@ -71,6 +71,12 @@ namespace MiniLink
         /// <summary>房间玩家列表</summary>
         public List<RoomPlayerInfo> Players { get; private set; } = new List<RoomPlayerInfo>();
 
+        /// <summary>大厅房间列表</summary>
+        public List<RoomState> AvailableRooms { get; private set; } = new List<RoomState>();
+
+        /// <summary>大厅房间总数</summary>
+        public int TotalRoomCount { get; private set; }
+
         #endregion
 
         #region Events
@@ -83,6 +89,7 @@ namespace MiniLink
         public UnityEvent<string> OnRoomError;
         public UnityEvent OnGameStarting;
         public UnityEvent OnGameStarted;
+        public event Action<List<RoomState>> OnRoomListReceived;
 
         #endregion
 
@@ -158,6 +165,10 @@ namespace MiniLink
             NetworkClient.SendJson(msg);
             CurrentRoom = null;
             Players.Clear();
+            if (FrameSyncManager.singleton != null)
+            {
+                FrameSyncManager.singleton.StopSync();
+            }
             OnRoomLeft?.Invoke();
         }
 
@@ -253,6 +264,14 @@ namespace MiniLink
         {
             if (singleton == null) return;
 
+            string previousRoomId = singleton.CurrentRoom?.roomId;
+            string previousState = singleton.CurrentRoom?.state;
+            var previousPlayers = new Dictionary<string, RoomPlayerInfo>();
+            foreach (var player in singleton.Players)
+            {
+                previousPlayers[player.playerId] = player;
+            }
+
             var state = RoomState.FromDict(roomData);
             singleton.CurrentRoom = state;
 
@@ -269,7 +288,113 @@ namespace MiniLink
                 }
             }
 
+            if (string.IsNullOrEmpty(previousRoomId) && !string.IsNullOrEmpty(state.roomId))
+            {
+                bool isCreateFlow = state.hostId == NetworkClient.connectionId && singleton.Players.Count <= 1;
+                if (isCreateFlow)
+                {
+                    singleton.OnRoomCreated?.Invoke();
+                    singleton.OnRoomCreatedCallback();
+                }
+                else
+                {
+                    singleton.OnRoomJoined?.Invoke();
+                    singleton.OnRoomJoinedCallback();
+                }
+            }
+
+            foreach (var player in singleton.Players)
+            {
+                if (!previousPlayers.ContainsKey(player.playerId))
+                {
+                    singleton.OnPlayerEnteredRoom(player);
+                }
+            }
+
+            foreach (var previousPlayer in previousPlayers.Values)
+            {
+                bool stillExists = false;
+                foreach (var current in singleton.Players)
+                {
+                    if (current.playerId == previousPlayer.playerId)
+                    {
+                        stillExists = true;
+                        break;
+                    }
+                }
+
+                if (!stillExists)
+                {
+                    singleton.OnPlayerLeftRoom(previousPlayer);
+                }
+            }
+
+            if (previousState != "PLAYING" && state.state == "PLAYING")
+            {
+                if (FrameSyncManager.singleton != null)
+                {
+                    FrameSyncManager.singleton.StartSync();
+                }
+                singleton.OnGameStarting?.Invoke();
+                singleton.OnGameStarted?.Invoke();
+                singleton.OnGameStartedCallback();
+            }
+
+            if (state.state == "READY")
+            {
+                singleton.OnAllPlayersReady();
+            }
+
             singleton.OnRoomUpdated?.Invoke(state);
+
+            ReconnectionManager.singleton?.SaveConnectionState(
+                NetworkClient.connection?.serverUrl,
+                NetworkClient.playerId,
+                state.roomId,
+                FrameSyncManager.singleton != null ? FrameSyncManager.singleton.currentFrame : 0
+            );
+        }
+
+        public static void OnRoomListResponse(Dictionary<string, object> roomListData)
+        {
+            if (singleton == null) return;
+
+            singleton.AvailableRooms.Clear();
+            if (roomListData.TryGetValue("rooms", out var roomsObj) && roomsObj is List<object> rooms)
+            {
+                foreach (var room in rooms)
+                {
+                    if (room is Dictionary<string, object> roomDict)
+                    {
+                        singleton.AvailableRooms.Add(RoomState.FromDict(roomDict));
+                    }
+                }
+            }
+
+            singleton.TotalRoomCount = roomListData.TryGetValue("total", out var totalObj)
+                ? Convert.ToInt32(totalObj)
+                : singleton.AvailableRooms.Count;
+
+            singleton.OnRoomListReceived?.Invoke(singleton.AvailableRooms);
+        }
+
+        public static void OnServerError(string errorMessage)
+        {
+            singleton?.OnRoomError?.Invoke(errorMessage);
+        }
+
+        public void OnReconnected(ReconnectResult result)
+        {
+            if (result?.roomState == null) return;
+
+            if (result.roomState.TryGetValue("room_id", out _))
+            {
+                OnRoomStateUpdate(result.roomState);
+            }
+            else if (CurrentRoom != null)
+            {
+                OnRoomUpdated?.Invoke(CurrentRoom);
+            }
         }
 
         #endregion

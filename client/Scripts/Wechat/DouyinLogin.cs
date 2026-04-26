@@ -46,6 +46,7 @@ namespace MiniLink
         public string OpenId { get; private set; }
         public string Nickname { get; set; } = "玩家";
         public string AvatarUrl { get; set; } = "";
+        private bool loginInProgress;
 
         #endregion
 
@@ -66,6 +67,7 @@ namespace MiniLink
             IsLoggedIn = false;
             Token = null;
             OpenId = null;
+            loginInProgress = false;
             Debug.Log("[DouyinLogin] 已登出");
         }
 
@@ -86,14 +88,14 @@ namespace MiniLink
         }
 
         /// <summary>抖音登录回调（由JSLIB调用）</summary>
-        private void OnTtLoginCode(string code)
+        public void OnTtLoginCode(string code)
         {
             Debug.Log($"[DouyinLogin] 获取到code: {code}");
             SendCodeToServer(code, "douyin");
         }
 
         /// <summary>匿名登录回调（抖音支持匿名登录）</summary>
-        private void OnTtAnonymousLogin(string anonymousCode)
+        public void OnTtAnonymousLogin(string anonymousCode)
         {
             Debug.Log($"[DouyinLogin] 匿名登录: {anonymousCode}");
             SendCodeToServer(anonymousCode, "douyin_anonymous");
@@ -121,6 +123,7 @@ namespace MiniLink
                 }
             };
 
+            loginInProgress = true;
             NetworkClient.SendJson(msg);
             StartCoroutine(WaitForLoginResponse());
         }
@@ -130,15 +133,15 @@ namespace MiniLink
             float timeout = 10f;
             float elapsed = 0f;
 
-            while (!IsLoggedIn && elapsed < timeout)
+            while (loginInProgress && !IsLoggedIn && elapsed < timeout)
             {
                 elapsed += Time.deltaTime;
                 yield return null;
             }
 
-            if (!IsLoggedIn)
+            if (loginInProgress && !IsLoggedIn)
             {
-                OnLoginFailed?.Invoke("登录超时");
+                HandleLoginFailed("登录超时");
             }
         }
 
@@ -147,9 +150,33 @@ namespace MiniLink
             Token = token;
             OpenId = openid;
             IsLoggedIn = true;
+            loginInProgress = false;
 
             Debug.Log($"[DouyinLogin] 登录成功: openid={openid}");
             OnLoginSuccess?.Invoke(openid);
+        }
+
+        public void HandleLoginFailed(string error)
+        {
+            loginInProgress = false;
+            Debug.LogError($"[DouyinLogin] 登录失败: {error}");
+            OnLoginFailed?.Invoke(error);
+        }
+
+        public void OnTtUserInfo(string userInfoJson)
+        {
+            var userInfo = MiniJson.Deserialize(userInfoJson) as System.Collections.Generic.Dictionary<string, object>;
+            if (userInfo == null) return;
+
+            if (userInfo.TryGetValue("nickName", out var nickname) && nickname != null)
+            {
+                Nickname = nickname.ToString();
+            }
+
+            if (userInfo.TryGetValue("avatarUrl", out var avatar) && avatar != null)
+            {
+                AvatarUrl = avatar.ToString();
+            }
         }
 
         #endregion
@@ -201,7 +228,7 @@ namespace MiniLink
         }
 
         /// <summary>视频广告奖励回调</summary>
-        private void OnVideoAdRewarded(string data)
+        public void OnVideoAdRewarded(string data)
         {
             Debug.Log("[DouyinLogin] 视频广告奖励");
             // 触发奖励事件
@@ -221,6 +248,7 @@ namespace MiniLink
             Token = mockToken;
             OpenId = mockOpenId;
             IsLoggedIn = true;
+            loginInProgress = false;
 
             Debug.Log($"[DouyinLogin] 模拟登录成功: {mockOpenId}");
             OnLoginSuccess?.Invoke(mockOpenId);

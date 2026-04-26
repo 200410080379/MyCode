@@ -8,9 +8,10 @@ namespace MiniLink
     /// <summary>
     /// 网络写入器 - 轻量级二进制序列化
     /// </summary>
-    public class NetworkWriter
+    public class NetworkWriter : IDisposable
     {
         private List<byte> buffer = new List<byte>(1024);
+        private bool returnedToPool;
 
         public void WriteByte(byte value) { buffer.Add(value); }
         public void WriteByte(int value) { buffer.Add((byte)value); }
@@ -93,9 +94,18 @@ namespace MiniLink
         public void Reset()
         {
             buffer.Clear();
+            returnedToPool = false;
         }
 
         public int Position => buffer.Count;
+
+        public void Dispose()
+        {
+            if (!returnedToPool)
+            {
+                Pool.Return(this);
+            }
+        }
 
         /// <summary>
         /// 对象池（参考 Mirror WriterPool）
@@ -106,12 +116,16 @@ namespace MiniLink
 
             public static NetworkWriter Get()
             {
-                return pool.Count > 0 ? pool.Pop() : new NetworkWriter();
+                var writer = pool.Count > 0 ? pool.Pop() : new NetworkWriter();
+                writer.returnedToPool = false;
+                return writer;
             }
 
             public static void Return(NetworkWriter writer)
             {
-                writer.Reset();
+                if (writer == null || writer.returnedToPool) return;
+                writer.buffer.Clear();
+                writer.returnedToPool = true;
                 pool.Push(writer);
             }
         }
@@ -120,7 +134,7 @@ namespace MiniLink
     /// <summary>
     /// 网络读取器 - 轻量级二进制反序列化
     /// </summary>
-    public class NetworkReader
+    public class NetworkReader : IDisposable
     {
         private byte[] buffer;
         private int position;
@@ -206,6 +220,11 @@ namespace MiniLink
         public int Position => position;
         public int Length => buffer.Length;
         public bool Finished => position >= buffer.Length;
+
+        public void Dispose()
+        {
+            // Reader 不持有非托管资源，保留 using 语义即可。
+        }
     }
 
     #region Message Structures

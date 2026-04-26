@@ -4,6 +4,7 @@
  */
 const axios = require('axios');
 const crypto = require('crypto');
+const { v4: uuidv4 } = require('uuid');
 
 class WechatAdapter {
   constructor(config = {}) {
@@ -186,8 +187,9 @@ class WechatAdapter {
   /**
    * 开发模式模拟登录
    */
+  // #21: 使用 uuid 替代 Date.now() 避免多客户端快速连接时 openid 冲突
   _mockLogin(code) {
-    const mockOpenid = `dev_${code}_${Date.now()}`;
+    const mockOpenid = `dev_${uuidv4().split('-')[0]}`;
     const mockSessionKey = crypto.randomBytes(16).toString('base64');
 
     this._sessionCache.set(mockOpenid, mockSessionKey);

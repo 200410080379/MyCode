@@ -6,6 +6,10 @@ class MessageHandler {
   constructor(server) {
     this.server = server;
 
+    // #2/#4: Command 处理器注册表
+    // key: methodHash (uint), value: async function(conn, cmd) => void
+    this._commandHandlers = new Map();
+
     // 消息类型→处理函数映射表
     this.handlers = {
       1:  this._onHandshakeReq.bind(this),
@@ -18,6 +22,7 @@ class MessageHandler {
       16: this._onRoomStart.bind(this),
       18: this._onRoomMatch.bind(this),
       20: this._onSyncVar.bind(this),
+      21: this._onSyncList.bind(this),   // #23: 注册 SyncList 处理器
       22: this._onSnapshot.bind(this),
       23: this._onInputFrame.bind(this),
       30: this._onCommand.bind(this),
@@ -34,17 +39,49 @@ class MessageHandler {
     };
   }
 
+  // ==================== #2/#4: Command 注册 API ====================
+
+  /**
+   * 注册 Command 处理器
+   * @param {number} methodHash - 方法哈希值（对应客户端 [Command] 标记的方法）
+   * @param {function} handler - 处理函数 async (conn, cmd) => void
+   */
+  registerCommandHandler(methodHash, handler) {
+    if (typeof handler !== 'function') {
+      throw new TypeError('[MessageHandler] Command handler 必须是函数');
+    }
+    this._commandHandlers.set(methodHash, handler);
+    console.log(`[MessageHandler] 注册 Command handler: hash=${methodHash}`);
+  }
+
+  /**
+   * 注销 Command 处理器
+   */
+  unregisterCommandHandler(methodHash) {
+    this._commandHandlers.delete(methodHash);
+  }
+
+  /**
+   * 清空所有 Command 处理器
+   */
+  clearCommandHandlers() {
+    this._commandHandlers.clear();
+  }
+
+  // ==================== 消息分发 ====================
+
   /**
    * 处理收到的消息
    */
   handle(conn, rawData) {
     let msg;
     try {
-      msg = JSON.parse(rawData);
+      msg = this.server.serializer.deserialize(rawData);
     } catch (err) {
       console.warn(`[MessageHandler] 无效消息 from ${conn.connId}`);
       return;
     }
+    if (!msg) return;
 
     // 处理批量消息
     if (Array.isArray(msg)) {
@@ -86,7 +123,10 @@ class MessageHandler {
       timestamp: Date.now(),
       handshake_resp: {
         success: true,
+        conn_id: conn.connId,
+        player_id: conn.playerId,
         session_id: conn.sessionId,
+        reconnect_token: conn.sessionId,
         server_time: new Date().toISOString(),
         reconnect_ttl: this.server.reconnectTTL / 1000,
       },
@@ -182,7 +222,6 @@ class MessageHandler {
       type: 14,
       seq: this.server.nextSeq(),
       timestamp: Date.now(),
-      // 复用 room_list_resp 结构
       room_list_resp: result,
     });
   }
@@ -226,14 +265,31 @@ class MessageHandler {
     // 通知客户端生成游戏对象
     const room = this.server.roomManager.getRoom(result.room_id);
     if (room) {
-      for (const [playerConnId, player] of room.players) {
+      this.server.frameSyncManager.initRoom(result.room_id, room.players.size);
+
+      for (const [playerConnId] of room.players) {
+        // #13: 使用 nextNetId() 而非 nextSeq()
+        const netId = this.server.nextNetId();
+        const playerConn = this.server.connections.get(playerConnId);
+
+        this.server.spawned.set(netId, {
+          ownerConnId: playerConnId,
+          prefabHash: 0,
+          state: null,
+        });
+
+        if (playerConn) {
+          playerConn.playerNetId = netId;
+          playerConn.ownedNetIds.add(netId);
+        }
+
         this.server.sendTo(playerConnId, {
           type: 40, // MSG_TYPE_SPAWN
           seq: this.server.nextSeq(),
           timestamp: Date.now(),
           spawn_msg: {
-            net_id: this.server.nextSeq(),
-            prefab_hash: 0, // 由业务层决定
+            net_id: netId,
+            prefab_hash: 0,
             owner_conn_id: playerConnId,
             initial_state: null,
           },
@@ -268,6 +324,33 @@ class MessageHandler {
     );
   }
 
+  /**
+   * #23: SyncList 消息处理
+   */
+  _onSyncList(conn, msg) {
+    const listMsg = msg.sync_list_msg;
+    if (!listMsg) return;
+
+    const { net_id, operation, items } = listMsg;
+    if (!net_id) return;
+
+    // 广播 SyncList 变更给房间内其他玩家
+    const roomId = this.server.roomManager.playerRoomMap.get(conn.connId);
+    if (!roomId) return;
+
+    this.server.broadcastToRoom(roomId, {
+      type: 21,
+      seq: this.server.nextSeq(),
+      timestamp: Date.now(),
+      sync_list_msg: {
+        net_id,
+        operation,
+        items,
+        source_conn_id: conn.connId,
+      },
+    }, conn.connId); // 排除发送者
+  }
+
   _onSnapshot(conn, msg) {
     this.server.syncManager.receiveSnapshot(
       conn.connId, msg.snapshot_msg
@@ -280,25 +363,57 @@ class MessageHandler {
     );
   }
 
-  // ==================== RPC ====================
+  // ==================== RPC / Command ====================
 
+  /**
+   * #2/#4: Command 处理器 - 完整实现
+   * 
+   * Command 是客户端调用、服务端执行的方法。
+   * 服务端收到 Command 后：
+   * 1. 验证权限（客户端只能发送自己拥有权限的对象的 Command）
+   * 2. 查找注册的 Command 处理器
+   * 3. 执行处理器（处理器内部可调用 ClientRpc 广播结果）
+   * 4. 同时通过 EventEmitter 通知上层
+   */
   _onCommand(conn, msg) {
     const cmd = msg.command_msg;
     if (!cmd) return;
 
     // 验证权限
-    if (cmd.requires_auth && !conn.isAuthenticated) {
-      conn.send(this._makeError('AUTH_FAILED', '未认证'));
-      return;
+    if (cmd.requires_authority) {
+      const netId = cmd.net_id;
+      if (!netId) {
+        conn.send(this._makeError('AUTH_FAILED', 'Command 缺少 net_id'));
+        return;
+      }
+      const spawnedObj = this.server.spawned.get(netId);
+      if (!spawnedObj || spawnedObj.ownerConnId !== conn.connId) {
+        conn.send(this._makeError('AUTH_FAILED', '无权执行此 Command'));
+        return;
+      }
     }
 
-    // Command 在服务端执行，通过 ClientRpc 返回结果给客户端
-    // 具体业务逻辑由上层注册的 handler 处理
-    // 这里只做路由 - 注意：如需要事件机制，请在 MiniLinkServer 中添加 EventEmitter
-    // this.server.emit('command', { conn, cmd });
+    const methodHash = cmd.method_hash;
 
-    // 简化实现：直接回复（实际项目应注册 Command 处理器）
-    console.log(`[MessageHandler] 收到Command: ${cmd.method_hash} from ${conn.connId}`);
+    // 查找注册的处理器
+    const handler = this._commandHandlers.get(methodHash);
+    if (handler) {
+      try {
+        // 执行注册的处理器
+        const result = handler(conn, cmd);
+        // 支持 async handler
+        if (result && typeof result.catch === 'function') {
+          result.catch(err => {
+            console.error(`[MessageHandler] Command handler 异常: hash=${methodHash}`, err);
+          });
+        }
+      } catch (err) {
+        console.error(`[MessageHandler] Command handler 执行失败: hash=${methodHash}`, err);
+      }
+    }
+
+    // #4: 通过 EventEmitter 通知上层（即使有注册 handler 也会触发）
+    this.server.emit('command', { conn, cmd });
   }
 
   // ==================== 微信 ====================
@@ -344,9 +459,8 @@ class MessageHandler {
   }
 
   _onWxShare(conn, msg) {
-    // 微信分享在客户端完成，服务端只记录
     const req = msg.wx_share_req;
-    console.log(`[MessageHandler] 分享: room=${req.room_id} by ${conn.connId}`);
+    console.log(`[MessageHandler] 分享: room=${req?.room_id} by ${conn.connId}`);
   }
 
   // ==================== 帧同步 ====================
@@ -354,23 +468,36 @@ class MessageHandler {
   _onFramePause(conn, msg) {
     const req = msg.frame_pause_msg;
     if (!req) return;
-    // 只有主机可以暂停
     const room = conn.roomId ? this.server.roomManager.getRoom(conn.roomId) : null;
     if (!room) return;
     const player = room.players.get(conn.connId);
-    if (!player || !player.isHost) return;
+    if (!player || !player.is_host) return;
     this.server.frameSyncManager.setPaused(conn.roomId, req.paused);
   }
 
+  /**
+   * #12: 帧同步输入 - 统一消息格式
+   * 客户端发送: { type: 72, frame, input_data, input_hash }
+   * 服务端接收后传递给 FrameSyncManager
+   */
   _onFrameInput(conn, msg) {
-    // 帧同步输入由 FrameSyncManager 处理
-    this.server.frameSyncManager.receiveInput(conn.connId, msg);
+    const connRoomId = conn.roomId;
+    if (!connRoomId) return;
+
+    // #12: 统一从消息顶层提取帧输入字段
+    // 客户端直接发送 frame/input_data/input_hash 在消息顶层
+    const frameInput = {
+      frame: msg.frame,
+      input_data: msg.input_data,
+      input_hash: msg.input_hash,
+    };
+
+    this.server.frameSyncManager.receiveInput(conn.connId, connRoomId, frameInput);
   }
 
   // ==================== 断线重连 ====================
 
   _onReconnectState(conn, msg) {
-    // 客户端查询重连状态
     const state = this.server.reconnectionManager.isWaitingReconnect(conn.connId);
     conn.send({
       type: 80,

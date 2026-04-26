@@ -20,6 +20,26 @@ namespace MiniLink
         
         public static ReconnectionManager singleton { get; private set; }
         
+        /// <summary>
+        /// #29: 获取或创建单例实例
+        /// 如果场景中没有 ReconnectionManager，自动创建
+        /// </summary>
+        public static ReconnectionManager GetOrCreate()
+        {
+            if (singleton != null) return singleton;
+            
+            // 尝试在场景中查找
+            singleton = FindObjectOfType<ReconnectionManager>();
+            if (singleton != null) return singleton;
+            
+            // 自动创建
+            var go = new GameObject("ReconnectionManager");
+            DontDestroyOnLoad(go);
+            singleton = go.AddComponent<ReconnectionManager>();
+            Debug.Log("[Reconnect] 自动创建 ReconnectionManager 单例");
+            return singleton;
+        }
+        
         private void Awake()
         {
             if (singleton != null && singleton != this)
@@ -28,6 +48,7 @@ namespace MiniLink
                 return;
             }
             singleton = this;
+            DontDestroyOnLoad(gameObject);
         }
         
         #endregion
@@ -161,8 +182,8 @@ namespace MiniLink
         /// </summary>
         public void SaveConnectionState(string serverUrl, string playerId, string roomId, long frame)
         {
-            lastServerUrl = serverUrl;
-            lastPlayerId = playerId;
+            lastServerUrl = string.IsNullOrEmpty(serverUrl) ? lastServerUrl : serverUrl;
+            lastPlayerId = string.IsNullOrEmpty(playerId) ? lastPlayerId : playerId;
             lastRoomId = roomId;
             lastFrame = frame;
         }
@@ -173,6 +194,16 @@ namespace MiniLink
         public void OnConnectionLost()
         {
             if (state == ReconnectState.Reconnecting) return;
+
+            if (string.IsNullOrEmpty(lastServerUrl) && NetworkClient.connection != null)
+            {
+                lastServerUrl = NetworkClient.connection.serverUrl;
+            }
+
+            if (string.IsNullOrEmpty(lastPlayerId))
+            {
+                lastPlayerId = NetworkClient.playerId;
+            }
             
             state = ReconnectState.Disconnected;
             isReconnecting = true;
@@ -261,8 +292,8 @@ namespace MiniLink
                 
                 if (!isReconnecting) yield break;
                 
-                // 尝试连接
-                bool connected = TryReconnect();
+                bool connected = false;
+                yield return StartCoroutine(TryReconnect(result => connected = result));
                 
                 if (connected)
                 {
@@ -285,27 +316,34 @@ namespace MiniLink
         /// <summary>
         /// 尝试重连
         /// </summary>
-        private bool TryReconnect()
+        private IEnumerator TryReconnect(Action<bool> onCompleted)
         {
-            if (string.IsNullOrEmpty(lastServerUrl)) return false;
+            if (string.IsNullOrEmpty(lastServerUrl))
+            {
+                onCompleted?.Invoke(false);
+                yield break;
+            }
             
             // 重新连接服务器
             NetworkClient.Reconnect(lastServerUrl);
             
             // 等待连接结果
             float waitTime = 0f;
-            float maxWait = currentRetryDelay * 0.8f; // 最多等待80%的延迟时间
+            float maxWait = Mathf.Max(1f, currentRetryDelay * 0.8f); // 最多等待80%的延迟时间
             
             while (waitTime < maxWait)
             {
                 if (NetworkClient.isConnected)
                 {
-                    return true;
+                    onCompleted?.Invoke(true);
+                    yield break;
                 }
-                waitTime += Time.deltaTime;
+
+                waitTime += Time.unscaledDeltaTime;
+                yield return null;
             }
             
-            return false;
+            onCompleted?.Invoke(NetworkClient.isConnected);
         }
         
         /// <summary>
@@ -331,13 +369,17 @@ namespace MiniLink
         
         /// <summary>
         /// 恢复帧同步
+        /// #9: 使用新的 StartReconnectCatchup 接口，正确补发丢失帧
         /// </summary>
         private void RestoreFrameSync(ReconnectResult result)
         {
-            // 通知帧同步管理器
+            // 通知帧同步管理器进入重连补帧模式
             if (FrameSyncManager.singleton != null)
             {
-                FrameSyncManager.singleton.StartSync(result.currentFrame);
+                FrameSyncManager.singleton.StartReconnectCatchup(
+                    result.disconnectedFrame,
+                    result.currentFrame
+                );
             }
             
             // 通知房间管理器
@@ -348,6 +390,18 @@ namespace MiniLink
             
             // 重启心跳
             EnableHeartbeat();
+        }
+
+        public void OnReconnectState(Dictionary<string, object> msg)
+        {
+            var stateMsg = msg["player_reconnect_msg"] as Dictionary<string, object>;
+            if (stateMsg == null) return;
+
+            string reconnectState = stateMsg.TryGetValue("state", out var value)
+                ? value?.ToString()
+                : "unknown";
+
+            Debug.Log($"[Reconnect] 当前服务端重连状态: {reconnectState}");
         }
         
         /// <summary>

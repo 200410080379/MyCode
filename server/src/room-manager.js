@@ -23,12 +23,10 @@ class RoomManager {
    * 创建房间
    */
   createRoom(connId, opts = {}) {
-    // 检查是否已在房间中
     if (this.playerRoomMap.has(connId)) {
       return { error: 'ALREADY_IN_ROOM', message: '已在房间中' };
     }
 
-    // 检查房间数上限
     if (this.rooms.size >= this.maxRooms) {
       return { error: 'ROOM_LIMIT', message: '服务器房间数已达上限' };
     }
@@ -41,7 +39,7 @@ class RoomManager {
       name: opts.room_name || `房间${roomId}`,
       password: opts.password || '',
       hostId: connId,
-      state: 'WAITING', // WAITING | READY | PLAYING | FINISHED
+      state: 'WAITING',
       maxPlayers,
       players: new Map(), // connId -> PlayerInfo
       settings: opts.settings || {},
@@ -50,8 +48,6 @@ class RoomManager {
     };
 
     this.rooms.set(roomId, room);
-
-    // 房主加入
     this._addPlayerToRoom(room, connId, true);
 
     return { room_id: roomId, room: this._roomToNotify(room) };
@@ -61,7 +57,6 @@ class RoomManager {
    * 加入房间
    */
   joinRoom(connId, roomId, password = '') {
-    // 检查是否已在房间中
     if (this.playerRoomMap.has(connId)) {
       return { error: 'ALREADY_IN_ROOM', message: '已在房间中' };
     }
@@ -71,17 +66,14 @@ class RoomManager {
       return { error: 'ROOM_NOT_FOUND', message: '房间不存在' };
     }
 
-    // 密码验证
     if (room.password && room.password !== password) {
       return { error: 'PASSWORD_WRONG', message: '房间密码错误' };
     }
 
-    // 人数检查
     if (room.players.size >= room.maxPlayers) {
       return { error: 'ROOM_FULL', message: '房间已满' };
     }
 
-    // 游戏中不允许加入（可选：改为允许旁观）
     if (room.state === 'PLAYING') {
       return { error: 'GAME_STARTED', message: '游戏已开始' };
     }
@@ -93,6 +85,7 @@ class RoomManager {
 
   /**
    * 离开房间
+   * #27: 调整调用顺序 — 先通知帧同步管理器，再从房间移除玩家
    */
   leaveRoom(connId) {
     const roomId = this.playerRoomMap.get(connId);
@@ -106,11 +99,20 @@ class RoomManager {
       return { error: 'ROOM_NOT_FOUND', message: '房间不存在' };
     }
 
+    // #27: 先通知帧同步管理器（此时玩家还在 room.players 中，状态一致）
+    if (room.state === 'PLAYING' && this.server.frameSyncManager) {
+      this.server.frameSyncManager.playerLeave(roomId, connId);
+    }
+
+    // 再从房间移除玩家
     this._removePlayerFromRoom(room, connId);
 
     // 房间空了则解散
     if (room.players.size === 0) {
       this.rooms.delete(roomId);
+      if (this.server.frameSyncManager) {
+        this.server.frameSyncManager.removeRoom(roomId);
+      }
       return { room_id: roomId, dismissed: true };
     }
 
@@ -138,8 +140,10 @@ class RoomManager {
 
     player.is_ready = ready;
 
-    // 检查是否所有人准备
     const allReady = this._checkAllReady(room);
+    if (room.state !== 'PLAYING') {
+      room.state = allReady ? 'READY' : 'WAITING';
+    }
 
     return { room_id: roomId, room: this._roomToNotify(room), all_ready: allReady };
   }
@@ -180,19 +184,16 @@ class RoomManager {
 
     const maxPlayers = opts.max_players || 4;
 
-    // 寻找可加入的房间
     for (const [roomId, room] of this.rooms) {
       if (room.state !== 'WAITING') continue;
-      if (room.password) continue; // 有密码的跳过
+      if (room.password) continue;
       if (room.players.size >= room.maxPlayers) continue;
       if (room.maxPlayers !== maxPlayers) continue;
 
-      // 找到合适房间，加入
       this._addPlayerToRoom(room, connId, false);
       return { room_id: roomId, room: this._roomToNotify(room) };
     }
 
-    // 没有合适房间，创建新房间
     return this.createRoom(connId, {
       room_name: '匹配房间',
       max_players: maxPlayers,
@@ -229,7 +230,6 @@ class RoomManager {
 
     const player = room.players.get(connId);
     if (player) {
-      // 标记为断线但不移除，等待重连
       player.disconnected = true;
       player.disconnectedAt = Date.now();
     }
@@ -242,24 +242,15 @@ class RoomManager {
     this.leaveRoom(connId);
   }
 
-  /**
-   * 获取房间信息
-   */
   getRoom(roomId) {
     return this.rooms.get(roomId) || null;
   }
 
-  /**
-   * 获取玩家所在房间
-   */
   getPlayerRoom(connId) {
     const roomId = this.playerRoomMap.get(connId);
     return roomId ? this.rooms.get(roomId) : null;
   }
 
-  /**
-   * 获取房间数量
-   */
   getRoomCount() {
     return this.rooms.size;
   }
@@ -283,7 +274,6 @@ class RoomManager {
     room.players.set(connId, playerInfo);
     this.playerRoomMap.set(connId, room.id);
 
-    // 更新连接的房间引用
     if (conn) conn.roomId = room.id;
   }
 
@@ -303,7 +293,6 @@ class RoomManager {
   }
 
   _generateRoomId() {
-    // 6位数字房间号，方便分享
     let id;
     do {
       id = String(Math.floor(100000 + Math.random() * 900000));
@@ -312,9 +301,15 @@ class RoomManager {
   }
 
   /**
-   * 转换为协议格式
+   * #19: 缓存房间通知数据，避免每次广播重复构建
+   * 当房间状态未变化时，直接返回缓存
    */
   _roomToNotify(room) {
+    // 如果有缓存且版本号一致，返回缓存
+    if (room._notifyCache && room._notifyVersion === room._version) {
+      return room._notifyCache;
+    }
+
     const players = [];
     for (const [connId, p] of room.players) {
       players.push({
@@ -327,7 +322,7 @@ class RoomManager {
       });
     }
 
-    return {
+    const result = {
       room_id: room.id,
       room_name: room.name,
       state: room.state,
@@ -336,6 +331,20 @@ class RoomManager {
       players,
       settings: room.settings,
     };
+
+    // 缓存结果
+    room._notifyCache = result;
+    room._notifyVersion = room._version || 0;
+
+    return result;
+  }
+
+  /**
+   * 使房间通知缓存失效
+   * 在任何修改房间状态的操作后调用
+   */
+  _invalidateRoomCache(room) {
+    room._version = (room._version || 0) + 1;
   }
 }
 

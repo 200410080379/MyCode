@@ -95,15 +95,17 @@ namespace MiniLink
         {
             if (!IsLocalPlayer) return;
 
-            // 发送RPC到服务端
-            CmdSetReady(value);
-        }
-
-        [Command]
-        private void CmdSetReady(bool value)
-        {
             ready = value;
-            // 服务端会广播更新
+            SetDirtyBit(0);
+
+            if (RoomManager != null)
+            {
+                RoomManager.SetReady(value);
+            }
+            else
+            {
+                Debug.LogWarning("[RoomPlayer] RoomManager 不存在，无法同步准备状态");
+            }
         }
 
         #endregion

@@ -1,10 +1,13 @@
-// 抖音小程序 WebSocket 桥接
+// MiniLink 抖音小程序 WebSocket 桥接
+// #25: 支持通过 window.__MiniLink_TtBridgeName 自定义回调目标对象名
 // API文档: https://developer.open-douyin.com/docs/resource/zh-CN/mini-game/develop/server/connect
 mergeInto(LibraryManager.library, {
     tt_connect_socket: function(url) {
         var urlStr = Pointer_stringify(url);
+        var bridgeName = (typeof window.__MiniLink_TtBridgeName !== 'undefined')
+            ? window.__MiniLink_TtBridgeName
+            : 'TtWebSocketBridge';
         
-        // 抖音小程序使用 tt.connectSocket
         var socketTask = tt.connectSocket({
             url: urlStr,
             success: function(res) {
@@ -12,26 +15,26 @@ mergeInto(LibraryManager.library, {
             },
             fail: function(err) {
                 console.error('[TtWebSocket] connect fail:', err);
-                SendMessage('TtWebSocketBridge', 'OnSocketError', err.errMsg || 'connect_failed');
+                SendMessage(bridgeName, 'OnSocketError', err.errMsg || 'connect_failed');
             }
         });
 
         var taskId = socketTask.socketTaskId || 1;
 
         socketTask.onOpen(function(res) {
-            SendMessage('TtWebSocketBridge', 'OnSocketOpen', taskId.toString());
+            SendMessage(bridgeName, 'OnSocketOpen', taskId.toString());
         });
 
         socketTask.onClose(function(res) {
-            SendMessage('TtWebSocketBridge', 'OnSocketClose', res.reason || 'closed');
+            SendMessage(bridgeName, 'OnSocketClose', res.reason || 'closed');
         });
 
         socketTask.onMessage(function(res) {
-            SendMessage('TtWebSocketBridge', 'OnSocketMessage', res.data);
+            SendMessage(bridgeName, 'OnSocketMessage', res.data);
         });
 
         socketTask.onError(function(err) {
-            SendMessage('TtWebSocketBridge', 'OnSocketError', err.errMsg || 'error');
+            SendMessage(bridgeName, 'OnSocketError', err.errMsg || 'error');
         });
 
         return taskId;

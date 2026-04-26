@@ -133,7 +133,7 @@ namespace MiniLink
         #region Callbacks (由 JavaScript SendMessage 调用)
 
         /// <summary>WebSocket连接成功回调（由 JSLIB SendMessage 调用）</summary>
-        private void OnSocketOpen(string taskId)
+        public void OnSocketOpen(string taskId)
         {
             Debug.Log($"[WxWebSocket] 连接成功 taskId={taskId}");
             isConnectedInternal = true;
@@ -142,7 +142,7 @@ namespace MiniLink
         }
 
         /// <summary>WebSocket断开回调</summary>
-        private void OnSocketClose(string reason)
+        public void OnSocketClose(string reason)
         {
             Debug.Log($"[WxWebSocket] 断开: {reason}");
             isConnectedInternal = false;
@@ -151,14 +151,14 @@ namespace MiniLink
         }
 
         /// <summary>WebSocket消息回调</summary>
-        private void OnSocketMessage(string message)
+        public void OnSocketMessage(string message)
         {
             byte[] data = System.Text.Encoding.UTF8.GetBytes(message);
             OnDataReceived?.Invoke(data);
         }
 
         /// <summary>WebSocket错误回调</summary>
-        private void OnSocketError(string errMsg)
+        public void OnSocketError(string errMsg)
         {
             Debug.LogError($"[WxWebSocket] 错误: {errMsg}");
             isConnectedInternal = false;

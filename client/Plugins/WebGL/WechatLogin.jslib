@@ -1,14 +1,20 @@
+// MiniLink 微信小程序登录和分享桥接
+// #25: 支持通过 window.__MiniLink_WechatLoginBridgeName 自定义回调目标对象名
+// 默认回调到 WechatLoginBridge（由 WechatLogin.cs 的 Awake 设置 gameObject.name）
 mergeInto(LibraryManager.library, {
     wx_login_native: function() {
+        var bridgeName = (typeof window.__MiniLink_WechatLoginBridgeName !== 'undefined')
+            ? window.__MiniLink_WechatLoginBridgeName
+            : 'WechatLoginBridge';
         wx.login({
             success: function(res) {
                 if (res.code) {
-                    SendMessage('WechatLoginBridge', 'OnWxLoginCode', res.code);
+                    SendMessage(bridgeName, 'OnWxLoginCode', res.code);
                 }
             },
             fail: function(err) {
                 console.error('[WechatLogin] wx.login fail:', err);
-                SendMessage('WechatLoginBridge', 'OnLoginFailed', err.errMsg || 'login_failed');
+                SendMessage(bridgeName, 'HandleLoginFailed', err.errMsg || 'login_failed');
             }
         });
     },
@@ -32,10 +38,13 @@ mergeInto(LibraryManager.library, {
     },
 
     wx_get_user_info: function() {
+        var bridgeName = (typeof window.__MiniLink_WechatLoginBridgeName !== 'undefined')
+            ? window.__MiniLink_WechatLoginBridgeName
+            : 'WechatLoginBridge';
         wx.getUserInfo({
             success: function(res) {
                 var userInfo = JSON.stringify(res.userInfo);
-                SendMessage('WechatLoginBridge', 'OnWxUserInfo', userInfo);
+                SendMessage(bridgeName, 'OnWxUserInfo', userInfo);
             },
             fail: function(err) {
                 console.error('[WechatLogin] getUserInfo fail:', err);

@@ -75,6 +75,11 @@ namespace MiniLink
         // 本地输入历史（用于回滚）
         private Dictionary<long, byte[]> localInputHistory = new Dictionary<long, byte[]>();
         
+        // #9: 重连补帧状态
+        private bool _isReconnectCatchup = false;
+        private int _reconnectCatchupCount = 0;
+        private int _expectedReconnectFrames = 0;
+        
         // 帧执行回调
         public Action<long, Dictionary<uint, byte[]>> onFrameExecute;
         
@@ -100,8 +105,7 @@ namespace MiniLink
         
         private void Start()
         {
-            frameInterval = 1f / frameRate;
-            frameBuffer = new FrameBuffer(maxRollbackFrames);
+            EnsureInitialized();
         }
         
         private void Update()
@@ -127,6 +131,7 @@ namespace MiniLink
         /// </summary>
         public void StartSync(long startFrame = 0)
         {
+            EnsureInitialized();
             currentFrame = startFrame;
             confirmedFrame = startFrame;
             isSynced = true;
@@ -141,6 +146,7 @@ namespace MiniLink
         /// </summary>
         public void StopSync()
         {
+            EnsureInitialized();
             isSynced = false;
             frameBuffer.Clear();
             pendingInputs.Clear();
@@ -160,22 +166,44 @@ namespace MiniLink
         
         /// <summary>
         /// 处理服务端确认帧
+        /// #9: 新增对断线重连补帧的支持
         /// </summary>
         public void OnFrameConfirm(long frame, Dictionary<uint, byte[]> inputs)
         {
+            EnsureInitialized();
             if (!isSynced) return;
             
-            // 检测是否有丢帧/乱序
-            if (frame <= confirmedFrame)
+            // #9: 断线重连后，服务端可能发送旧的 missed frames
+            // 这里的关键是：如果 frame <= confirmedFrame 且不是重连恢复模式，才忽略
+            if (frame <= confirmedFrame && !_isReconnectCatchup)
             {
-                // 旧帧，可能是重传，忽略
+                return;
+            }
+            
+            // #9: 重连补帧模式 - 按顺序执行所有补发帧
+            if (_isReconnectCatchup)
+            {
+                // 执行补发帧
+                frameBuffer.StoreFrame(frame, inputs);
+                ExecuteFrame(frame, inputs);
+                onFrameConfirmed?.Invoke(frame);
+                
+                _reconnectCatchupCount++;
+                
+                // 当补帧数达到预期时，恢复正常模式
+                if (_reconnectCatchupCount >= _expectedReconnectFrames)
+                {
+                    _isReconnectCatchup = false;
+                    confirmedFrame = frame;
+                    currentFrame = frame + 1;
+                    Debug.Log($"[FrameSync] 重连补帧完成，当前帧: {frame}");
+                }
                 return;
             }
             
             // 检测是否需要回滚
             if (enableRollback && frame < currentFrame)
             {
-                // 需要回滚到确认帧重新执行
                 RollbackTo(frame);
             }
             
@@ -190,6 +218,43 @@ namespace MiniLink
             
             // 回调
             onFrameConfirmed?.Invoke(frame);
+
+            if (isPaused && currentFrame - confirmedFrame <= maxPredictionFrames)
+            {
+                isPaused = false;
+            }
+
+            ReconnectionManager.singleton?.SaveConnectionState(
+                NetworkClient.connection?.serverUrl,
+                NetworkClient.playerId,
+                NetworkRoomManager.singleton?.CurrentRoomId,
+                confirmedFrame
+            );
+        }
+        
+        /// <summary>
+        /// #9: 开始断线重连补帧模式
+        /// 由 ReconnectionManager 在重连成功后调用
+        /// </summary>
+        /// <param name="disconnectedFrame">断线时的帧号</param>
+        /// <param name="currentFrameServer">服务端当前帧号</param>
+        public void StartReconnectCatchup(long disconnectedFrame, long currentFrameServer)
+        {
+            _isReconnectCatchup = true;
+            _reconnectCatchupCount = 0;
+            _expectedReconnectFrames = (int)(currentFrameServer - disconnectedFrame);
+            confirmedFrame = disconnectedFrame; // 临时回退，允许旧帧通过
+            
+            Debug.Log($"[FrameSync] 开始重连补帧: from={disconnectedFrame} to={currentFrameServer}, 共{_expectedReconnectFrames}帧");
+            
+            if (_expectedReconnectFrames <= 0)
+            {
+                // 没有丢失帧，直接恢复
+                _isReconnectCatchup = false;
+                confirmedFrame = currentFrameServer;
+                currentFrame = currentFrameServer + 1;
+                Debug.Log("[FrameSync] 无丢失帧，直接恢复");
+            }
         }
         
         /// <summary>
@@ -255,6 +320,19 @@ namespace MiniLink
             };
             
             NetworkClient.SendJson(msg);
+        }
+
+        private void EnsureInitialized()
+        {
+            if (frameInterval <= 0f)
+            {
+                frameInterval = 1f / Mathf.Max(1, frameRate);
+            }
+
+            if (frameBuffer == null)
+            {
+                frameBuffer = new FrameBuffer(maxRollbackFrames);
+            }
         }
         
         /// <summary>

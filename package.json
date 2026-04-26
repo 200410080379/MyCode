@@ -1,21 +1,31 @@
 {
-  "name": "mycode",
+  "name": "minilink",
   "version": "1.0.0",
-  "description": "nothing",
-  "main": "index.js",
+  "description": "MiniLink - 小程序游戏多人联机轻量化框架",
+  "private": true,
   "directories": {
     "doc": "docs"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "server": "cd server && npm start",
+    "server:dev": "cd server && npm run dev",
+    "proto": "cd server && npm run proto"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/200410080379/MyCode.git"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "minilink",
+    "weixin",
+    "miniprogram",
+    "multiplayer",
+    "websocket",
+    "game",
+    "networking"
+  ],
+  "author": "李康",
+  "license": "MIT",
   "bugs": {
     "url": "https://github.com/200410080379/MyCode/issues"
   },

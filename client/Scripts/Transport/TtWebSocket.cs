@@ -127,7 +127,7 @@ namespace MiniLink
 
         #region Callbacks (由 JavaScript SendMessage 调用)
 
-        private void OnSocketOpen(string taskId)
+        public void OnSocketOpen(string taskId)
         {
             Debug.Log($"[TtWebSocket] 连接成功 taskId={taskId}");
             isConnectedInternal = true;
@@ -135,7 +135,7 @@ namespace MiniLink
             OnConnected?.Invoke();
         }
 
-        private void OnSocketClose(string reason)
+        public void OnSocketClose(string reason)
         {
             Debug.Log($"[TtWebSocket] 断开: {reason}");
             isConnectedInternal = false;
@@ -143,13 +143,13 @@ namespace MiniLink
             OnDisconnected?.Invoke();
         }
 
-        private void OnSocketMessage(string message)
+        public void OnSocketMessage(string message)
         {
             byte[] data = System.Text.Encoding.UTF8.GetBytes(message);
             OnDataReceived?.Invoke(data);
         }
 
-        private void OnSocketError(string errMsg)
+        public void OnSocketError(string errMsg)
         {
             Debug.LogError($"[TtWebSocket] 错误: {errMsg}");
             isConnectedInternal = false;

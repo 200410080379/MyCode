@@ -46,7 +46,7 @@ class Connection {
   send(data) {
     if (!this.ws || this.ws.readyState !== 1) return false;
     try {
-      const payload = typeof data === 'string' ? data : JSON.stringify(data);
+      const payload = typeof data === 'string' ? data : this.server.serializer.serialize(data);
       this.ws.send(payload);
       return true;
     } catch (err) {

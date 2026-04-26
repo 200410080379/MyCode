@@ -57,6 +57,8 @@ namespace MiniLink
         /// <summary>头像URL</summary>
         public string AvatarUrl { get; set; } = "";
 
+        private bool loginInProgress;
+
         #endregion
 
         #region Public API
@@ -83,6 +85,7 @@ namespace MiniLink
             IsLoggedIn = false;
             Token = null;
             OpenId = null;
+            loginInProgress = false;
             Debug.Log("[WechatLogin] 已登出");
         }
 
@@ -115,7 +118,7 @@ namespace MiniLink
         /// <summary>
         /// 微信登录回调（由JSLIB调用）
         /// </summary>
-        private void OnWxLoginCode(string code)
+        public void OnWxLoginCode(string code)
         {
             Debug.Log($"[WechatLogin] 获取到code: {code}");
 
@@ -147,6 +150,7 @@ namespace MiniLink
                 }
             };
 
+            loginInProgress = true;
             NetworkClient.SendJson(msg);
 
             // 等待服务端响应（通过消息处理）
@@ -158,15 +162,15 @@ namespace MiniLink
             float timeout = 10f;
             float elapsed = 0f;
 
-            while (!IsLoggedIn && elapsed < timeout)
+            while (loginInProgress && !IsLoggedIn && elapsed < timeout)
             {
                 elapsed += Time.deltaTime;
                 yield return null;
             }
 
-            if (!IsLoggedIn)
+            if (loginInProgress && !IsLoggedIn)
             {
-                OnLoginFailed?.Invoke("登录超时");
+                HandleLoginFailed("登录超时");
             }
         }
 
@@ -178,9 +182,33 @@ namespace MiniLink
             Token = token;
             OpenId = openid;
             IsLoggedIn = true;
+            loginInProgress = false;
 
             Debug.Log($"[WechatLogin] 登录成功: openid={openid}");
             OnLoginSuccess?.Invoke(openid);
+        }
+
+        public void HandleLoginFailed(string error)
+        {
+            loginInProgress = false;
+            Debug.LogError($"[WechatLogin] 登录失败: {error}");
+            OnLoginFailed?.Invoke(error);
+        }
+
+        public void OnWxUserInfo(string userInfoJson)
+        {
+            var userInfo = MiniJson.Deserialize(userInfoJson) as System.Collections.Generic.Dictionary<string, object>;
+            if (userInfo == null) return;
+
+            if (userInfo.TryGetValue("nickName", out var nickname) && nickname != null)
+            {
+                Nickname = nickname.ToString();
+            }
+
+            if (userInfo.TryGetValue("avatarUrl", out var avatar) && avatar != null)
+            {
+                AvatarUrl = avatar.ToString();
+            }
         }
 
         #endregion
@@ -223,6 +251,7 @@ namespace MiniLink
             Token = mockToken;
             OpenId = mockOpenId;
             IsLoggedIn = true;
+            loginInProgress = false;
 
             Debug.Log($"[WechatLogin] 模拟登录成功: {mockOpenId}");
             OnLoginSuccess?.Invoke(mockOpenId);

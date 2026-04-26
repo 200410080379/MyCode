@@ -22,7 +22,7 @@ class FrameSyncManager {
     this.roomFrameStates = new Map();
     
     // 玩家最后输入帧
-    // connId -> lastFrame
+    // connId -> { frame, inputData }
     this.playerLastFrame = new Map();
     
     // 启动帧同步定时器
@@ -58,7 +58,7 @@ class FrameSyncManager {
     if (!state) return;
     
     state.expectedPlayers++;
-    this.playerLastFrame.set(connId, state.currentFrame);
+    this.playerLastFrame.set(connId, { frame: state.currentFrame, inputData: null });
   }
   
   /**
@@ -68,26 +68,25 @@ class FrameSyncManager {
     const state = this.roomFrameStates.get(roomId);
     if (!state) return;
     
-    state.expectedPlayers--;
+    state.expectedPlayers = Math.max(1, state.expectedPlayers - 1);
     state.pendingInputs.delete(connId);
     this.playerLastFrame.delete(connId);
   }
   
   /**
-   * 接收玩家输入
+   * #12: 接收玩家输入 - 统一接口
+   * @param {string} connId - 连接ID
+   * @param {string} roomId - 房间ID
+   * @param {object} frameInput - { frame, input_data, input_hash }
    */
-  receiveInput(connId, msg) {
-    const conn = this.server.connections.get(connId);
-    if (!conn || !conn.roomId) return;
-    
-    const state = this.roomFrameStates.get(conn.roomId);
+  receiveInput(connId, roomId, frameInput) {
+    const state = this.roomFrameStates.get(roomId);
     if (!state || state.paused) return;
     
-    const { frame, input_data, input_hash } = msg;
+    const { frame, input_data, input_hash } = frameInput;
     
     // 验证帧号（防止客户端作弊）
     if (frame < state.currentFrame - 10) {
-      // 客户端落后太多，可能需要快进
       console.warn(`[FrameSync] 玩家 ${connId} 帧号落后: ${frame} vs ${state.currentFrame}`);
       return;
     }
@@ -100,10 +99,10 @@ class FrameSyncManager {
       receivedAt: Date.now(),
     });
     
-    this.playerLastFrame.set(connId, frame);
+    this.playerLastFrame.set(connId, { frame, inputData: input_data });
     
     // 检查是否所有玩家都已提交
-    this._tryAdvanceFrame(conn.roomId);
+    this._tryAdvanceFrame(roomId);
   }
   
   /**
@@ -115,9 +114,8 @@ class FrameSyncManager {
     
     state.paused = paused;
     
-    // 广播暂停/恢复消息
     this.server.broadcastToRoom(roomId, {
-      type: 70, // MSG_TYPE_FRAME_PAUSE
+      type: 70,
       seq: this.server.nextSeq(),
       timestamp: Date.now(),
       frame_pause_msg: {
@@ -139,58 +137,41 @@ class FrameSyncManager {
   
   // ==================== 内部方法 ====================
   
-  /**
-   * 启动帧同步循环
-   */
   _startFrameLoop() {
     this.frameIntervalId = setInterval(() => {
       this._tick();
     }, this.frameInterval);
   }
   
-  /**
-   * 帧同步主循环
-   */
   _tick() {
     const now = Date.now();
     
     for (const [roomId, state] of this.roomFrameStates) {
       if (state.paused) continue;
       
-      // 检查是否超时
       const elapsed = now - state.lastFrameTime;
       if (elapsed >= this.inputTimeout) {
-        // 超时，强制推进帧
         this._forceAdvanceFrame(roomId, state);
       } else {
-        // 正常检查
         this._tryAdvanceFrame(roomId);
       }
     }
   }
   
-  /**
-   * 尝试推进帧
-   */
   _tryAdvanceFrame(roomId) {
     const state = this.roomFrameStates.get(roomId);
     if (!state || state.paused) return;
     
-    // 检查是否所有玩家都已提交输入
     if (state.pendingInputs.size >= state.expectedPlayers) {
       this._advanceFrame(roomId, state);
     }
   }
   
-  /**
-   * 推进帧（正常）
-   */
   _advanceFrame(roomId, state) {
     const now = Date.now();
     
-    // 构造确认帧消息
     const confirmMsg = {
-      type: 71, // MSG_TYPE_FRAME_CONFIRM
+      type: 71,
       seq: this.server.nextSeq(),
       timestamp: now,
       frame_confirm_msg: {
@@ -207,9 +188,14 @@ class FrameSyncManager {
       time: now,
     });
     
-    // 只保留最近60帧历史（3秒）
-    if (state.frameHistory.length > 60) {
+    // 只保留最近120帧历史（6秒@20Hz），增大以支持断线重连
+    if (state.frameHistory.length > 120) {
       state.frameHistory.shift();
+    }
+
+    // 缓存到重连管理器
+    if (this.server.reconnectionManager) {
+      this.server.reconnectionManager.cacheFrame(roomId, confirmMsg.frame_confirm_msg);
     }
     
     // 广播确认帧
@@ -221,13 +207,9 @@ class FrameSyncManager {
     state.lastFrameTime = now;
   }
   
-  /**
-   * 强制推进帧（超时）
-   */
   _forceAdvanceFrame(roomId, state) {
     const now = Date.now();
     
-    // 获取房间内所有玩家
     const room = this.server.roomManager.getRoom(roomId);
     if (!room) return;
     
@@ -236,27 +218,20 @@ class FrameSyncManager {
       if (player.disconnected) continue;
       
       if (!state.pendingInputs.has(connId)) {
-        // 使用上一帧的输入或空输入
-        const lastInput = this._getLastInput(connId) || { inputData: Buffer.alloc(0) };
+        const lastInput = this._getLastInput(connId);
         state.pendingInputs.set(connId, {
           frame: state.currentFrame,
-          inputData: lastInput.inputData,
+          inputData: lastInput ? lastInput.inputData : null,
           receivedAt: now,
           timeout: true,
         });
       }
     }
     
-    // 推进帧
     this._advanceFrame(roomId, state);
-    
-    // 记录超时统计
     this._recordTimeout(roomId);
   }
   
-  /**
-   * 序列化输入
-   */
   _serializeInputs(pendingInputs) {
     const result = [];
     for (const [connId, input] of pendingInputs) {
@@ -272,24 +247,16 @@ class FrameSyncManager {
   }
   
   /**
-   * 获取玩家最后输入
+   * #12 修复: _getLastInput 现在从 playerLastFrame 中实际获取上一次输入
    */
   _getLastInput(connId) {
-    const lastFrame = this.playerLastFrame.get(connId);
-    // 从帧历史中查找
-    return null; // 简化实现
+    return this.playerLastFrame.get(connId) || null;
   }
   
-  /**
-   * 记录超时统计
-   */
   _recordTimeout(roomId) {
     // 用于监控和调试
   }
   
-  /**
-   * 获取统计信息
-   */
   getStats() {
     const stats = {
       rooms: this.roomFrameStates.size,
@@ -309,9 +276,6 @@ class FrameSyncManager {
     return stats;
   }
   
-  /**
-   * 清理
-   */
   destroy() {
     if (this.frameIntervalId) {
       clearInterval(this.frameIntervalId);
